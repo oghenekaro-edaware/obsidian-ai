@@ -76,16 +76,17 @@ async def execute_call_teammate(
     if depth >= MAX_DELEGATION_DEPTH:
         return json.dumps({"error": "Delegation depth limit reached — the teammate you're asking cannot delegate further."})
 
+    tm_lower = (teammate_name or "").lower()
     if db_type == "mongo":
         target = next(
             (ag_pr for ag_pr in agents_with_providers
-             if ag_pr[0].get("name", "").lower() == teammate_name.lower() and str(ag_pr[0]["_id"]) != str(current_agent_id)),
+             if (ag_pr[0].get("name") or "").lower() == tm_lower and str(ag_pr[0]["_id"]) != str(current_agent_id)),
             None,
         )
     else:
         target = next(
             (ag_pr for ag_pr in agents_with_providers
-             if ag_pr[0].name.lower() == teammate_name.lower() and ag_pr[0].id != current_agent_id),
+             if (ag_pr[0].name or "").lower() == tm_lower and ag_pr[0].id != current_agent_id),
             None,
         )
 
@@ -185,8 +186,9 @@ def build_maf_handoff_team(
 
     start_ag = maf_agents[0]
     if start_agent_name:
+        sa_lower = (start_agent_name or "").lower()
         for ag in maf_agents:
-            if ag.name.lower() == start_agent_name.lower():
+            if (getattr(ag, "name", "") or "").lower() == sa_lower:
                 start_ag = ag
                 break
 
