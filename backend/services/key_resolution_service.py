@@ -79,21 +79,23 @@ async def resolve_embedding_credentials(
             f"[resolve_embedding_credentials] Secret resolution yielded no API key for user '{user_id}'. "
             f"Attempting fallback to active LLMProvider matching provider_type '{provider}'."
         )
-        provider_match_types = [provider]
-        if provider.lower() in ("google", "gemini"):
+        prov_str = (provider or "").lower()
+        provider_match_types = [provider] if provider else []
+        if prov_str in ("google", "gemini"):
             provider_match_types = ["google", "gemini"]
-        elif provider.lower() in ("nvidia", "nvidia_nim"):
+        elif prov_str in ("nvidia", "nvidia_nim"):
             provider_match_types = ["nvidia", "nvidia_nim"]
 
         if DATABASE_TYPE == "mongo":
             mongo_db = get_database()
-            prov = await mongo_db["llm_providers"].find_one({
-                "user_id": str(user_id),
-                "provider_type": {"$in": provider_match_types},
-                "is_active": True
-            })
-            if prov and prov.get("api_key"):
-                api_key = decrypt_api_key(prov["api_key"])
+            if mongo_db is not None:
+                prov = await mongo_db["llm_providers"].find_one({
+                    "user_id": str(user_id),
+                    "provider_type": {"$in": provider_match_types},
+                    "is_active": True
+                })
+                if prov and prov.get("api_key"):
+                    api_key = decrypt_api_key(prov["api_key"])
         else:
             if db is not None:
                 from models import LLMProvider

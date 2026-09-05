@@ -10,6 +10,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from routers.chat_router import _resolve_http_tool_request_params
 
 logger = logging.getLogger(__name__)
 
@@ -462,23 +463,27 @@ def _execute_tool_sqlite(tool_name: str, arguments_str: str, db) -> str:
     ).first()
     if not tool_def:
         return json.dumps({"error": f"Tool '{tool_name}' not found"})
-    if tool_def.handler_type == "python":
+    handler_type = (tool_def.handler_type or "").lower()
+    if handler_type == "python":
         config = json.loads(tool_def.handler_config) if tool_def.handler_config else {}
-        return _exec_python_tool(config.get("code", ""), arguments)
-    elif tool_def.handler_type == "http":
+        return _exec_python_tool(config.get("code") or "", arguments)
+    elif handler_type == "http":
         import httpx
         config = json.loads(tool_def.handler_config) if tool_def.handler_config else {}
-        url = config.get("url", "")
-        method = config.get("method", "POST").upper()
-        headers = config.get("headers", {})
+        url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, tool_name)
         if not url:
             return json.dumps({"error": "No URL configured"})
         try:
-            with httpx.Client(timeout=30.0) as client:
+            with httpx.Client(timeout=30.0, follow_redirects=True) as client:
                 if method == "GET":
-                    resp = client.get(url, params=arguments, headers=headers)
+                    resp = client.get(url, params=params, headers=headers)
                 else:
-                    resp = client.request(method, url, json=arguments, headers=headers)
+                    if isinstance(body, (dict, list)):
+                        resp = client.request(method, url, json=body, headers=headers)
+                    elif body is not None:
+                        resp = client.request(method, url, content=str(body), headers=headers)
+                    else:
+                        resp = client.request(method, url, headers=headers)
                 return resp.text
         except Exception as e:
             return json.dumps({"error": str(e)})
@@ -882,24 +887,27 @@ async def _execute_tool_mongo_native(tool_name: str, arguments_str: str, mongo_d
     tool_def = await mongo_db[ToolDefinitionCollection.collection_name].find_one({"name": tool_name, "is_active": True})
     if not tool_def:
         return json.dumps({"error": f"Tool '{tool_name}' not found"})
-    handler_type = tool_def.get("handler_type", "")
+    handler_type = (tool_def.get("handler_type") or "").lower()
     config_raw = tool_def.get("handler_config")
     config = json.loads(config_raw) if isinstance(config_raw, str) and config_raw else (config_raw or {})
     if handler_type == "python":
-        return _exec_python_tool(config.get("code", ""), arguments)
+        return _exec_python_tool(config.get("code") or "", arguments)
     elif handler_type == "http":
         import httpx
-        url = config.get("url", "")
-        method = config.get("method", "POST").upper()
-        headers = config.get("headers", {})
+        url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, tool_name)
         if not url:
             return json.dumps({"error": "No URL configured"})
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
                 if method == "GET":
-                    resp = await client.get(url, params=arguments, headers=headers)
+                    resp = await client.get(url, params=params, headers=headers)
                 else:
-                    resp = await client.request(method, url, json=arguments, headers=headers)
+                    if isinstance(body, (dict, list)):
+                        resp = await client.request(method, url, json=body, headers=headers)
+                    elif body is not None:
+                        resp = await client.request(method, url, content=str(body), headers=headers)
+                    else:
+                        resp = await client.request(method, url, headers=headers)
                 return resp.text
         except Exception as e:
             return json.dumps({"error": str(e)})
@@ -936,7 +944,7 @@ async def _chat_non_streaming_mongo(llm, messages, system_prompt, tools, mcp_con
         tool_def = await collection.find_one({"name": tc_name, "is_active": True})
         if not tool_def:
             return json.dumps({"error": f"Tool '{tc_name}' not found"})
-        handler_type = tool_def.get("handler_type", "")
+        handler_type = (tool_def.get("handler_type") or "").lower()
         handler_config_raw = tool_def.get("handler_config")
         if isinstance(handler_config_raw, str):
             try:
@@ -948,20 +956,23 @@ async def _chat_non_streaming_mongo(llm, messages, system_prompt, tools, mcp_con
         else:
             config = {}
         if handler_type == "python":
-            return _exec_python_tool(config.get("code", ""), arguments)
+            return _exec_python_tool(config.get("code") or "", arguments)
         elif handler_type == "http":
             import httpx
-            url = config.get("url", "")
-            method = config.get("method", "POST").upper()
-            headers = config.get("headers", {})
+            url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, tc_name)
             if not url:
                 return json.dumps({"error": "No URL configured"})
             try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
                     if method == "GET":
-                        resp = await client.get(url, params=arguments, headers=headers)
+                        resp = await client.get(url, params=params, headers=headers)
                     else:
-                        resp = await client.request(method, url, json=arguments, headers=headers)
+                        if isinstance(body, (dict, list)):
+                            resp = await client.request(method, url, json=body, headers=headers)
+                        elif body is not None:
+                            resp = await client.request(method, url, content=str(body), headers=headers)
+                        else:
+                            resp = await client.request(method, url, headers=headers)
                     return resp.text
             except Exception as e:
                 return json.dumps({"error": str(e)})

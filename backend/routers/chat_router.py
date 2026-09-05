@@ -690,6 +690,19 @@ _ANTHROPIC_CACHE_READ_PER_1M  = 0.3   # USD per 1M cache-read tokens
 _ANTHROPIC_CACHE_WRITE_PER_1M = 3.75  # USD per 1M cache-write tokens (sonnet pricing)
 
 
+def _extract_usage_tokens(usage: Any) -> tuple[int, int]:
+    """Extract (input_tokens, output_tokens) from various usage formats (dict, UsageDetails object, etc.)."""
+    if not usage:
+        return 0, 0
+    if isinstance(usage, dict):
+        inp = usage.get("input_tokens") or usage.get("input_token_count") or usage.get("prompt_tokens") or 0
+        out = usage.get("output_tokens") or usage.get("output_token_count") or usage.get("completion_tokens") or 0
+        return int(inp or 0), int(out or 0)
+    inp = getattr(usage, "input_tokens", None) or getattr(usage, "input_token_count", None) or getattr(usage, "prompt_tokens", None) or 0
+    out = getattr(usage, "output_tokens", None) or getattr(usage, "output_token_count", None) or getattr(usage, "completion_tokens", None) or 0
+    return int(inp or 0), int(out or 0)
+
+
 def _estimate_cost_usd(
     model_name: str,
     input_tokens: int,
@@ -1209,6 +1222,54 @@ def _scan_content_for_elements(full_content: str, prev_len: int, edit_target: tu
     return events
 
 
+def _resolve_http_tool_request_params(config: dict, arguments: dict, tool_name: str = "") -> tuple[str, str, dict, dict | None, Any]:
+    """
+    Resolve URL, method, headers, params, and body for an HTTP tool call.
+    Allows runtime arguments (url, endpoint, method, headers, body, data) to override or format handler_config.
+    """
+    url = arguments.get("url") or arguments.get("endpoint") or config.get("url", "")
+    config_url = config.get("url", "")
+    used_keys = set()
+    if "{" in config_url and "}" in config_url:
+        try:
+            url = config_url.format(**arguments)
+            import string
+            formatter = string.Formatter()
+            used_keys = {fname for _, fname, _, _ in formatter.parse(config_url) if fname}
+        except Exception:
+            pass
+
+    raw_method = arguments.get("method") or config.get("method")
+    if not raw_method:
+        tn = (tool_name or "").lower()
+        raw_method = "GET" if any(k in tn for k in ("get", "search", "fetch", "query", "list", "find")) else "POST"
+    method = str(raw_method).upper()
+
+    headers = dict(config.get("headers") or {})
+    if isinstance(arguments.get("headers"), dict):
+        headers.update(arguments["headers"])
+
+    payload_args = {
+        k: v for k, v in arguments.items()
+        if k not in ("url", "endpoint", "method", "headers") and k not in used_keys
+    }
+
+    body = None
+    params = None
+
+    if method == "GET":
+        params = payload_args if payload_args else None
+    else:
+        if "body" in payload_args and len(payload_args) == 1:
+            body = payload_args["body"]
+        elif "data" in payload_args and len(payload_args) == 1:
+            body = payload_args["data"]
+        elif payload_args:
+            body = payload_args
+
+    return url, method, headers, params, body
+
+
 def _execute_python_tool(code_str: str, arguments: dict) -> str:
     """Execute a Python tool handler and return the result as a string."""
     try:
@@ -1238,27 +1299,31 @@ def _execute_tool(tool_name: str, arguments_str: str, db) -> str:
     if not tool_def:
         return json.dumps({"error": f"Tool '{tool_name}' not found"})
 
-    if tool_def.handler_type == "python":
+    handler_type = (tool_def.handler_type or "").lower()
+    if handler_type == "python":
         config = json.loads(tool_def.handler_config) if tool_def.handler_config else {}
-        code_str = config.get("code", "")
+        code_str = config.get("code") or ""
         if not code_str:
             return json.dumps({"error": "No code configured for this tool"})
         return _execute_python_tool(code_str, arguments)
 
-    elif tool_def.handler_type == "http":
+    elif handler_type == "http":
         import httpx
         config = json.loads(tool_def.handler_config) if tool_def.handler_config else {}
-        url = config.get("url", "")
-        method = config.get("method", "POST").upper()
-        headers = config.get("headers", {})
+        url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, tool_name)
         if not url:
             return json.dumps({"error": "No URL configured for this tool"})
         try:
-            with httpx.Client(timeout=30.0) as client:
+            with httpx.Client(timeout=30.0, follow_redirects=True) as client:
                 if method == "GET":
-                    resp = client.get(url, params=arguments, headers=headers)
+                    resp = client.get(url, params=params, headers=headers)
                 else:
-                    resp = client.request(method, url, json=arguments, headers=headers)
+                    if isinstance(body, (dict, list)):
+                        resp = client.request(method, url, json=body, headers=headers)
+                    elif body is not None:
+                        resp = client.request(method, url, content=str(body), headers=headers)
+                    else:
+                        resp = client.request(method, url, headers=headers)
                 return resp.text
         except Exception as e:
             return json.dumps({"error": f"HTTP request failed: {e}"})
@@ -1279,7 +1344,7 @@ async def _execute_tool_mongo(tool_name: str, arguments_str: str, mongo_db) -> s
     if not tool_def:
         return json.dumps({"error": f"Tool '{tool_name}' not found"})
 
-    handler_type = tool_def.get("handler_type", "")
+    handler_type = (tool_def.get("handler_type") or "").lower()
     handler_config_raw = tool_def.get("handler_config")
     if isinstance(handler_config_raw, str):
         try:
@@ -1292,24 +1357,27 @@ async def _execute_tool_mongo(tool_name: str, arguments_str: str, mongo_db) -> s
         config = {}
 
     if handler_type == "python":
-        code_str = config.get("code", "")
+        code_str = config.get("code") or ""
         if not code_str:
             return json.dumps({"error": "No code configured for this tool"})
         return _execute_python_tool(code_str, arguments)
 
     elif handler_type == "http":
         import httpx
-        url = config.get("url", "")
-        method = config.get("method", "POST").upper()
-        headers = config.get("headers", {})
+        url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, tool_name)
         if not url:
             return json.dumps({"error": "No URL configured for this tool"})
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
                 if method == "GET":
-                    resp = await client.get(url, params=arguments, headers=headers)
+                    resp = await client.get(url, params=params, headers=headers)
                 else:
-                    resp = await client.request(method, url, json=arguments, headers=headers)
+                    if isinstance(body, (dict, list)):
+                        resp = await client.request(method, url, json=body, headers=headers)
+                    elif body is not None:
+                        resp = await client.request(method, url, content=str(body), headers=headers)
+                    else:
+                        resp = await client.request(method, url, headers=headers)
                 return resp.text
         except Exception as e:
             return json.dumps({"error": f"HTTP request failed: {e}"})
@@ -2669,6 +2737,13 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
                     yield {"event": "error", "data": json.dumps({"error": str(e)})}
                     return
 
+                u_details = getattr(update, "usage_details", None)
+                if u_details:
+                    u_inp, u_out = _extract_usage_tokens(u_details)
+                    if u_inp or u_out:
+                        token_usage["input_tokens"] = max(token_usage.get("input_tokens", 0), u_inp)
+                        token_usage["output_tokens"] = max(token_usage.get("output_tokens", 0), u_out)
+
                 for c in getattr(update, "contents", []):
                     ctype = getattr(c, "type", None)
                     if ctype == "text" or (ctype is None and getattr(c, "text", None)):
@@ -2689,6 +2764,7 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
                         tc_id = getattr(c, "call_id", "") or getattr(c, "id", "")
                         tc_name = getattr(c, "name", "")
                         tc_args = getattr(c, "arguments", {})
+                        _tc.record_tool_span(tc_name, json.dumps(tc_args) if isinstance(tc_args, dict) else str(tc_args), "", 0, status="running")
                         yield {
                             "event": "tool_call",
                             "data": json.dumps({
@@ -2702,6 +2778,7 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
                         tc_id = getattr(c, "call_id", "") or getattr(c, "id", "")
                         tc_name = getattr(c, "name", "")
                         result_val = getattr(c, "result", "")
+                        _tc.record_tool_span(tc_name, "", str(result_val), 0, status="completed")
                         yield {
                             "event": "tool_call",
                             "data": json.dumps({
@@ -2714,6 +2791,11 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
                         }
                         for ev in _yield_tool_element_events(tc_name, str(result_val)):
                             yield ev
+                    elif ctype == "usage" or hasattr(c, "usage_details"):
+                        c_inp, c_out = _extract_usage_tokens(getattr(c, "usage_details", None) or c)
+                        if c_inp or c_out:
+                            token_usage["input_tokens"] = max(token_usage.get("input_tokens", 0), c_inp)
+                            token_usage["output_tokens"] = max(token_usage.get("output_tokens", 0), c_out)
 
             while not event_queue.empty():
                 yield event_queue.get_nowait()
@@ -2722,6 +2804,22 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
         latency_ms = int((time.time() - start_time) * 1000)
         input_tokens = token_usage.get("input_tokens", 0)
         output_tokens = token_usage.get("output_tokens", 0)
+        if not input_tokens and messages:
+            input_tokens = _estimate_tokens(messages)
+        if not output_tokens and full_content:
+            output_tokens = max(1, len(full_content) // 4)
+
+        token_usage["input_tokens"] = input_tokens
+        token_usage["output_tokens"] = output_tokens
+
+        _tc.record_llm_span(
+            model_name=(agent.model_id if agent else None) or provider_record.model_id,
+            usage=token_usage,
+            duration_ms=latency_ms,
+            round_number=0,
+            prompt_preview=(messages[-1].content or "") if messages else "",
+            response_preview=full_content,
+        )
         metadata = {
             "model": (agent.model_id if agent else None) or provider_record.model_id,
             "provider": provider_record.provider_type,
@@ -5176,7 +5274,7 @@ async def respond_hitl(
     db: DBSession = Depends(get_db),
 ):
     from datetime import datetime
-    status = request.status.lower()
+    status = (request.status or "").lower()
     if status in ("rejected", "deny"):
         status = "denied"
     if status not in ("approved", "denied"):
