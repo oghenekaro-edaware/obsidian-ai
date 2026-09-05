@@ -87,7 +87,7 @@ class SpanData:
             "workflow_run_id": self.workflow_run_id,
             "message_id": self.message_id,
             "span_type": self.span_type,
-            "name": self.name,
+            "name": self.name or self.span_type or "span",
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cache_read_tokens": self.cache_read_tokens,
@@ -141,7 +141,7 @@ class TraceContext:
             session_id=str(self.session_id) if self.session_id is not None else None,
             workflow_run_id=str(self.workflow_run_id) if self.workflow_run_id is not None else None,
             span_type=span_type,
-            name=name,
+            name=name or span_type or "span",
             sequence=self.next_sequence(),
             attributes=attributes or {},
         )
@@ -177,7 +177,7 @@ class DatabaseTraceProvider:
 
     async def export_span(self, span: SpanData) -> None:
         span_dict = span.to_dict()
-        if DATABASE_TYPE == "mongo" or self.mongo_db is not None:
+        if self.mongo_db is not None or (DATABASE_TYPE == "mongo" and self.db is None):
             try:
                 from database_mongo import get_database
                 from models_mongo import TraceSpanCollection
@@ -204,7 +204,7 @@ class DatabaseTraceProvider:
                         workflow_run_id=wrid,
                         message_id=mid,
                         span_type=span.span_type,
-                        name=span.name,
+                        name=span.name or span.span_type or "span",
                         input_tokens=span.input_tokens,
                         output_tokens=span.output_tokens,
                         cache_read_tokens=span.cache_read_tokens,

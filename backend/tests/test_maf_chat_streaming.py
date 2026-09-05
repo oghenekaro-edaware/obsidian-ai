@@ -386,3 +386,70 @@ async def test_client_disconnection_and_cancellation(db_session):
     with pytest.raises(asyncio.CancelledError):
         async for _ in stream_gen:
             pass
+
+
+class MockContentFunctionResultNoName:
+    type = "function_result"
+    call_id = "call_none_name_123"
+    name = None
+    result = "ok\n"
+
+
+class MockContentFunctionCallWithName:
+    type = "function_call"
+    call_id = "call_none_name_123"
+    name = "http_request_2"
+    arguments = {}
+
+
+@pytest.mark.asyncio
+async def test_maf_streaming_function_result_with_none_name(db_session):
+    """
+    Test that when MAF streams a FunctionResultContent with name=None,
+    the tool_name_map maps call_id back to the function_call name ('http_request_2'),
+    and exports trace_spans without a NULL constraint failure.
+    """
+    from tracing_service import set_trace_provider, DatabaseTraceProvider
+    set_trace_provider(DatabaseTraceProvider(db=db_session))
+
+    mock_llm = MagicMock()
+
+    async def mock_stream():
+        yield MockUpdate([MockContentFunctionCallWithName()])
+        yield MockUpdate([MockContentFunctionResultNoName()])
+
+    class MockRunStream:
+        def __aiter__(self):
+            return mock_stream()
+
+    mock_llm.run.return_value = MockRunStream()
+
+    from llm.base import LLMMessage
+    messages = [LLMMessage(role="user", content="Call http_request_2")]
+    provider_record = db_session.query(LLMProvider).first()
+    agent = db_session.query(Agent).first()
+    chat_session = db_session.query(SessionModel).first()
+
+    events = []
+    async for ev in _stream_response(
+        llm=mock_llm,
+        messages=messages,
+        system_prompt="Test system prompt",
+        db=db_session,
+        session_id=chat_session.id,
+        agent_id=agent.id,
+        provider_record=provider_record,
+        start_time=1000.0,
+        agent=agent,
+    ):
+        events.append(ev)
+
+    # Wait briefly for background trace export asyncio tasks to finish
+    await asyncio.sleep(0.05)
+
+    from models import TraceSpan
+    spans = db_session.query(TraceSpan).filter(TraceSpan.session_id == chat_session.id).all()
+    tool_spans = [s for s in spans if s.span_type == "tool_call"]
+    assert len(tool_spans) >= 2
+    for s in tool_spans:
+        assert s.name == "http_request_2"
