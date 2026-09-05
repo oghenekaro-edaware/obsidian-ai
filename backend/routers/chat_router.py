@@ -740,7 +740,7 @@ class _TraceContext:
         cache_creation_tokens = usage.get("cache_creation_input_tokens", 0) or 0
         cost_usd = _estimate_cost_usd(model_name, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
 
-        span = self.core_ctx.create_span(name=model_name, span_type="llm_call")
+        span = self.core_ctx.create_span(name=model_name or "llm_call", span_type="llm_call")
         span.input_tokens = input_tokens
         span.output_tokens = output_tokens
         span.cache_read_tokens = cache_read_tokens
@@ -760,7 +760,7 @@ class _TraceContext:
     def record_tool_span(self, tool_name: str, arguments_str: str, result: str,
                          duration_ms: int, round_number: int = 0,
                          span_type: str = "tool_call", status: str = "success"):
-        span = self.core_ctx.create_span(name=tool_name, span_type=span_type)
+        span = self.core_ctx.create_span(name=tool_name or span_type or "tool_call", span_type=span_type)
         span.duration_ms = duration_ms
         span.status = status
         span.round_number = round_number
@@ -2691,6 +2691,7 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
 
         event_queue = asyncio.Queue()
         _tc = _TraceContext(session_id=session_id, db=db)
+        tool_name_map: dict[str, str] = {}
 
         function_invocation_kwargs = {
             "session_id": str(session_id),
@@ -2761,8 +2762,11 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
                             reasoning_parts.append(reasoning_delta)
                             yield {"event": "reasoning_delta", "data": json.dumps({"content": reasoning_delta})}
                     elif ctype == "function_call":
-                        tc_id = getattr(c, "call_id", "") or getattr(c, "id", "")
-                        tc_name = getattr(c, "name", "")
+                        tc_id = getattr(c, "call_id", None) or getattr(c, "id", None) or ""
+                        tc_raw_name = getattr(c, "name", None)
+                        if tc_id and tc_raw_name:
+                            tool_name_map[tc_id] = tc_raw_name
+                        tc_name = tc_raw_name or tool_name_map.get(tc_id) or "tool_call"
                         tc_args = getattr(c, "arguments", {})
                         _tc.record_tool_span(tc_name, json.dumps(tc_args) if isinstance(tc_args, dict) else str(tc_args), "", 0, status="running")
                         yield {
@@ -2775,8 +2779,9 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
                             })
                         }
                     elif ctype == "function_result":
-                        tc_id = getattr(c, "call_id", "") or getattr(c, "id", "")
-                        tc_name = getattr(c, "name", "")
+                        tc_id = getattr(c, "call_id", None) or getattr(c, "id", None) or ""
+                        tc_raw_name = getattr(c, "name", None)
+                        tc_name = tc_raw_name or tool_name_map.get(tc_id) or "tool_call"
                         result_val = getattr(c, "result", "")
                         _tc.record_tool_span(tc_name, "", str(result_val), 0, status="completed")
                         yield {
@@ -4157,7 +4162,7 @@ async def _stream_response_mongo(llm, messages, system_prompt, mongo_db, session
         await _save_trace_span_mongo(mongo_db, {
             "session_id": session_id,
             "span_type": "llm_call",
-            "name": (agent.get("model_id") if agent else None) or provider_record.get("model_id"),
+            "name": (agent.get("model_id") if agent else None) or provider_record.get("model_id") or "llm_call",
             "input_tokens": usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),
             "duration_ms": duration_ms,
@@ -4174,7 +4179,7 @@ async def _stream_response_mongo(llm, messages, system_prompt, mongo_db, session
         await _save_trace_span_mongo(mongo_db, {
             "session_id": session_id,
             "span_type": span_type,
-            "name": tool_name,
+            "name": tool_name or span_type or "tool_call",
             "input_tokens": 0,
             "output_tokens": 0,
             "duration_ms": duration_ms,
@@ -4575,7 +4580,7 @@ async def _stream_response_with_mcp_mongo(llm, messages, system_prompt, mongo_db
             await _save_trace_span_mongo(mongo_db, {
                 "session_id": session_id,
                 "span_type": "llm_call",
-                "name": (agent.get("model_id") if agent else None) or provider_record.get("model_id"),
+                "name": (agent.get("model_id") if agent else None) or provider_record.get("model_id") or "llm_call",
                 "input_tokens": usage.get("input_tokens", 0),
                 "output_tokens": usage.get("output_tokens", 0),
                 "duration_ms": duration_ms,
@@ -4592,7 +4597,7 @@ async def _stream_response_with_mcp_mongo(llm, messages, system_prompt, mongo_db
             await _save_trace_span_mongo(mongo_db, {
                 "session_id": session_id,
                 "span_type": span_type,
-                "name": tool_name,
+                "name": tool_name or span_type or "tool_call",
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "duration_ms": duration_ms,
