@@ -19,23 +19,72 @@ class GoogleProvider(BaseLLMProvider):
         )
 
     def _build_contents(self, messages: list[LLMMessage]) -> list[dict]:
-        contents = []
+        # Pre-pass: map tool_call_id -> tool_name from assistant messages
+        id_to_name: dict[str, str] = {}
         for m in messages:
-            role = "user" if m.role == "user" else "model"
-            if isinstance(m.content, list):
-                parts = []
-                for part in m.content:
-                    if part.get("type") == "text":
-                        parts.append({"text": part["text"]})
-                    elif part.get("type") == "image_url":
-                        url = part["image_url"]["url"]
-                        if url.startswith("data:"):
-                            header, b64data = url.split(",", 1)
-                            mime = header.split(":")[1].split(";")[0]
-                            parts.append({"inline_data": {"mime_type": mime, "data": b64data}})
-                contents.append({"role": role, "parts": parts})
+            if getattr(m, "tool_calls", None):
+                for tc in m.tool_calls:
+                    if getattr(tc, "id", None) and getattr(tc, "name", None):
+                        id_to_name[tc.id] = tc.name
+
+        contents: list[dict] = []
+        for m in messages:
+            if m.role == "tool":
+                role = "user"
+                tool_name = id_to_name.get(m.tool_call_id or "")
+                if not tool_name and m.tool_call_id and m.tool_call_id.startswith("call_"):
+                    tool_name = m.tool_call_id[5:]
+                tool_name = tool_name or m.tool_call_id or "function"
+
+                if isinstance(m.content, dict):
+                    resp_dict = m.content
+                elif isinstance(m.content, str):
+                    try:
+                        parsed = json.loads(m.content)
+                        if isinstance(parsed, dict):
+                            resp_dict = parsed
+                        else:
+                            resp_dict = {"result": parsed}
+                    except Exception:
+                        resp_dict = {"result": m.content}
+                else:
+                    resp_dict = {"result": str(m.content) if m.content is not None else ""}
+
+                parts = [{"functionResponse": {"name": tool_name, "response": resp_dict}}]
             else:
-                contents.append({"role": role, "parts": [{"text": m.content}]})
+                role = "user" if m.role == "user" else "model"
+                parts = []
+                if isinstance(m.content, list):
+                    for part in m.content:
+                        if part.get("type") == "text":
+                            parts.append({"text": part["text"]})
+                        elif part.get("type") == "image_url":
+                            url = part["image_url"]["url"]
+                            if url.startswith("data:"):
+                                header, b64data = url.split(",", 1)
+                                mime = header.split(":")[1].split(";")[0]
+                                parts.append({"inline_data": {"mime_type": mime, "data": b64data}})
+                elif m.content:
+                    parts.append({"text": str(m.content)})
+
+                # Add functionCalls for assistant/model messages with tool_calls
+                if role == "model" and getattr(m, "tool_calls", None):
+                    for tc in m.tool_calls:
+                        try:
+                            args = json.loads(tc.arguments) if isinstance(tc.arguments, str) else (tc.arguments or {})
+                        except Exception:
+                            args = {}
+                        parts.append({"functionCall": {"name": tc.name, "args": args}})
+
+                if not parts:
+                    parts = [{"text": ""}]
+
+            # Merge with previous message if same role (Gemini requires strict alternating user/model turns)
+            if contents and contents[-1]["role"] == role:
+                contents[-1]["parts"].extend(parts)
+            else:
+                contents.append({"role": role, "parts": parts})
+
         return contents
 
     def _convert_tools(self, tools: list[dict]) -> list[dict]:

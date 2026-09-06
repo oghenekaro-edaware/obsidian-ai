@@ -26,55 +26,83 @@ class AnthropicProvider(BaseLLMProvider):
         return headers
 
     @staticmethod
-    def _to_anthropic_content(content):
-        """Convert LLMMessage content to Anthropic content format.
-        Handles both str and list[dict] (multimodal) forms."""
-        if isinstance(content, str):
-            return content
-        parts = []
-        for part in content:
-            if part.get("type") == "text":
-                parts.append({"type": "text", "text": part["text"]})
-            elif part.get("type") == "image_url":
-                url = part["image_url"]["url"]
-                if url.startswith("data:"):
-                    header, b64data = url.split(",", 1)
-                    media_type = header.split(":")[1].split(";")[0]
-                    parts.append({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": b64data,
-                        },
-                    })
-        return parts if parts else ""
+    def _to_anthropic_content(m: LLMMessage):
+        """Convert LLMMessage content to Anthropic content format (list of blocks).
+        Handles text, image_url, tool_use (assistant tool calls), and tool_result (role='tool')."""
+        blocks = []
+
+        if m.role == "tool":
+            tool_use_id = m.tool_call_id or "call_unknown"
+            content_str = str(m.content) if m.content is not None else ""
+            blocks.append({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content_str,
+            })
+            return blocks
+
+        if isinstance(m.content, str):
+            if m.content:
+                blocks.append({"type": "text", "text": m.content})
+        elif isinstance(m.content, list):
+            for part in m.content:
+                if part.get("type") == "text":
+                    blocks.append({"type": "text", "text": part["text"]})
+                elif part.get("type") == "image_url":
+                    url = part["image_url"]["url"]
+                    if url.startswith("data:"):
+                        header, b64data = url.split(",", 1)
+                        media_type = header.split(":")[1].split(";")[0]
+                        blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64data,
+                            },
+                        })
+
+        if m.role == "assistant" and getattr(m, "tool_calls", None):
+            for i, tc in enumerate(m.tool_calls):
+                tool_id = tc.id or f"call_{i}"
+                try:
+                    args = json.loads(tc.arguments) if isinstance(tc.arguments, str) else (tc.arguments or {})
+                except Exception:
+                    args = {}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": tc.name,
+                    "input": args,
+                })
+
+        return blocks
 
     @staticmethod
     def _merge_content(prev, new):
-        """Merge two Anthropic content values (str or list) for consecutive same-role messages."""
-        if isinstance(prev, str) and isinstance(new, str):
-            return prev + "\n\n" + new
-
-        prev_list = [{"type": "text", "text": prev}] if isinstance(prev, str) else list(prev)
-        new_list = [{"type": "text", "text": new}] if isinstance(new, str) else list(new)
+        """Merge two Anthropic content values (str or list of blocks) for consecutive same-role messages."""
+        prev_list = [{"type": "text", "text": prev}] if isinstance(prev, str) else list(prev or [])
+        new_list = [{"type": "text", "text": new}] if isinstance(new, str) else list(new or [])
         return prev_list + new_list
 
     def _build_messages(self, messages: list[LLMMessage]) -> list[dict]:
         """Build messages for Anthropic, merging consecutive same-role messages
         since Anthropic requires alternating user/assistant roles.
-        Tool role messages are converted to user messages with the result as content."""
+        Tool role messages are converted to user messages with tool_result blocks."""
         result = []
         for m in messages:
-            # Convert tool role to user role for Anthropic compatibility
-            role = "user" if m.role == "tool" else m.role
-            content = self._to_anthropic_content(m.content)
-            if not content:
-                continue
+            role = "user" if m.role in ("user", "tool") else "assistant"
+            blocks = self._to_anthropic_content(m)
+            if not blocks:
+                if role == "assistant":
+                    blocks = [{"type": "text", "text": ""}]
+                else:
+                    continue
+
             if result and result[-1]["role"] == role:
-                result[-1]["content"] = self._merge_content(result[-1]["content"], content)
+                result[-1]["content"] = self._merge_content(result[-1]["content"], blocks)
             else:
-                result.append({"role": role, "content": content})
+                result.append({"role": role, "content": blocks})
         return result
 
     def _convert_tools(self, tools: list[dict]) -> list[dict]:
