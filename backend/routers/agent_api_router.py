@@ -3,8 +3,9 @@ import time
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from config import DATABASE_TYPE
 from database import get_db
-from models import Agent, AgentVersion, AgentAPIConfig, Application, ApplicationAgentAccess, Schema, SchemaVersion, APIRequest, Message, KnowledgeBase
+from models import Agent, AgentVersion, AgentAPIConfig, Application, ApplicationAgentAccess, Schema, SchemaVersion, APIRequest, Message, KnowledgeBase, TraceSpan
 from auth import get_current_user, get_application_api_key, TokenData, ApplicationKeyData
 from schemas import AgentAPIConfigCreate, ExternalInvokeRequest
 from services.schema_validation_service import validate_json_schema
@@ -316,7 +317,36 @@ async def invoke_agent(agent_id: int, body: ExternalInvokeRequest, db: Session =
     if errors:
         db.add(APIRequest(request_id=request_id, application_id=int(key.application_id), api_key_id=int(key.api_key_id), agent_id=agent_id, agent_version_id=config.published_version_id, status="failed", error_code="OUTPUT_SCHEMA_VALIDATION_FAILED", duration_ms=int((time.monotonic()-started)*1000))); db.commit()
         raise HTTPException(status_code=502, detail={"error": {"code": "OUTPUT_SCHEMA_VALIDATION_FAILED", "message": "Agent output failed schema validation", "request_id": request_id, "details": errors}})
-    db.add(Message(session_id=session.id, role="assistant", content=json.dumps(output)))
+    assistant_msg = Message(session_id=session.id, role="assistant", content=json.dumps(output))
+    db.add(assistant_msg)
+    db.commit()
+    db.refresh(assistant_msg)
+
+    # Allow background trace export tasks to complete before backfilling message_id
+    import asyncio
+    await asyncio.sleep(0.05)
+
+    # Back-fill message_id on all trace spans recorded during this invocation response
+    if DATABASE_TYPE == "mongo":
+        try:
+            from database_mongo import get_database
+            mongo_db = get_database()
+            await mongo_db["trace_spans"].update_many(
+                {"session_id": str(session.id), "message_id": None},
+                {"$set": {"message_id": str(assistant_msg.id)}}
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            db.query(TraceSpan).filter(
+                TraceSpan.session_id == session.id,
+                TraceSpan.message_id.is_(None),
+            ).update({"message_id": assistant_msg.id})
+            db.commit()
+        except Exception:
+            pass
+
     db.add(APIRequest(request_id=request_id, application_id=int(key.application_id), api_key_id=int(key.api_key_id), agent_id=agent_id, agent_version_id=config.published_version_id, status="completed", duration_ms=int((time.monotonic()-started)*1000))); db.commit()
-    version = db.get(AgentVersion, config.published_version_id)
+    version = db.get(AgentVersion, config.published_version_id) if config.published_version_id else None
     return {"request_id": request_id, "session_id": str(session.id), "agent_id": str(agent_id), "agent_version": version.version_number if version else None, "input_schema_version": input_schema.version_number, "output_schema_version": output_schema.version_number, "status": "completed", "output": output}

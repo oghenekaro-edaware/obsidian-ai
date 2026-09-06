@@ -315,3 +315,165 @@ def test_external_invoke_supports_session_context():
 
     assert request.system_instruction == "Answer in bullets."
     assert request.knowledge_base_ids == ["1", "2", "3"]
+
+
+def test_agent_invocation_executes_configured_tools_mcps_and_trace_spans(setup_data):
+    import json
+    from unittest.mock import patch, MagicMock
+    from models import ToolDefinition, MCPServer, LLMProvider, TraceSpan, Message, Session
+
+    db = next(get_db())
+    try:
+        user = setup_data["user"]
+        agent = setup_data["agent"]
+
+        # Create LLMProvider
+        provider = LLMProvider(
+            user_id=user.id,
+            name="Mock Provider",
+            provider_type="openai",
+            model_id="gpt-4o",
+            api_key="enc_key",
+        )
+        db.add(provider)
+        db.flush()
+
+        agent = db.get(Agent, setup_data["agent"].id)
+        agent.provider_id = provider.id
+        db.commit()
+
+        # 1. Create a custom tool definition
+        custom_tool = ToolDefinition(
+            user_id=user.id,
+            name="get_weather_info",
+            description="Get weather for location",
+            handler_type="python",
+            handler_config=json.dumps({"code": "def handler(location):\n    return f'Sunny in {location}'"}),
+            parameters_json=json.dumps({
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"],
+            }),
+            is_active=True,
+        )
+        db.add(custom_tool)
+        db.flush()
+
+        agent.tools_json = json.dumps([custom_tool.id])
+
+        # 2. Create an MCP server record
+        mcp_server = MCPServer(
+            user_id=user.id,
+            name="echo_mcp",
+            transport_type="stdio",
+            command="echo",
+            is_active=True,
+        )
+        db.add(mcp_server)
+        db.flush()
+
+        agent.mcp_servers_json = json.dumps([mcp_server.id])
+        db.commit()
+
+        # Mock MCP connection & tool discovery
+        mock_mcp_conn = MagicMock()
+        async def mock_call_tool(name, args):
+            return f"MCP Echo: {args.get('msg')}"
+        mock_mcp_conn.call_tool = mock_call_tool
+
+        mcp_tools = [{
+            "type": "function",
+            "function": {
+                "name": "mcp__echo_mcp__echo_tool",
+                "description": "Echo message via MCP",
+                "parameters": {"type": "object", "properties": {"msg": {"type": "string"}}},
+            }
+        }]
+
+        async def mock_connect_mcp_servers(stack, configs):
+            return {"echo_mcp": mock_mcp_conn}, mcp_tools
+
+        call_count = 0
+        async def mock_chat_stream(messages, system_prompt=None, tools=None, response_schema=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                tool_names = [t["function"]["name"] for t in tools] if tools else []
+                assert "get_weather_info" in tool_names
+                assert "mcp__echo_mcp__echo_tool" in tool_names
+
+                class ToolChunk1:
+                    type = "tool_call"
+                    class ToolCall1:
+                        id = "call_1"
+                        name = "get_weather_info"
+                        arguments = {"location": "London"}
+                    tool_call = ToolCall1()
+
+                class ToolChunk2:
+                    type = "tool_call"
+                    class ToolCall2:
+                        id = "call_2"
+                        name = "mcp__echo_mcp__echo_tool"
+                        arguments = {"msg": "hello"}
+                    tool_call = ToolCall2()
+
+                class DoneChunk:
+                    type = "done"
+                    usage = {"input_tokens": 10, "output_tokens": 10}
+                    finish_reason = "tool_calls"
+                    tool_call = None
+
+                yield ToolChunk1()
+                yield ToolChunk2()
+                yield DoneChunk()
+            else:
+                class ContentChunk:
+                    type = "content"
+                    content = json.dumps({"answer": "Weather is sunny and MCP responded hello"})
+                    tool_call = None
+                class DoneChunk:
+                    type = "done"
+                    usage = {"input_tokens": 15, "output_tokens": 15}
+                    finish_reason = "stop"
+                    tool_call = None
+                yield ContentChunk()
+                yield DoneChunk()
+
+        mock_llm = MagicMock()
+        mock_llm.chat_stream = mock_chat_stream
+
+        with patch("llm.provider_factory.create_provider_from_config", return_value=mock_llm), \
+             patch("encryption.decrypt_api_key", return_value="fake_key"), \
+             patch("routers.chat_router._connect_mcp_servers", side_effect=mock_connect_mcp_servers), \
+             patch("rag_service.VectorStoreContextProvider.before_run"), \
+             patch("routers.memory_router.MemoryContextProvider.before_run"):
+
+            payload = {"input": {"query": "What is the weather?"}}
+            res = client.post(
+                f"/api/v1/agent-invocations/{agent.id}",
+                headers={"Authorization": f"Bearer {setup_data['api_key']}"},
+                json=payload,
+            )
+
+            assert res.status_code == 200
+            data = res.json()
+            assert data["status"] == "completed"
+            assert "Weather is sunny" in data["output"]["answer"]
+
+            session_id = int(data["session_id"])
+            spans = db.query(TraceSpan).filter(TraceSpan.session_id == session_id).all()
+            assert len(spans) >= 2
+
+            assistant_msg = db.query(Message).filter(Message.session_id == session_id, Message.role == "assistant").first()
+            assert assistant_msg is not None
+
+            for span in spans:
+                assert span.message_id == assistant_msg.id
+
+            mcp_spans = [s for s in spans if s.span_type == "mcp_call"]
+            tool_spans = [s for s in spans if s.span_type == "tool_call"]
+            assert len(mcp_spans) >= 1
+            assert len(tool_spans) >= 1
+    finally:
+        db.close()

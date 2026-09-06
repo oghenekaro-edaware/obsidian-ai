@@ -16,8 +16,11 @@ import logging
 import re
 from typing import Optional
 from dataclasses import dataclass, field
+from contextlib import AsyncExitStack
 
 from config import DATABASE_TYPE
+from services.tool_executor import tool_executor, ToolRuntimeContext
+from mcp_client import parse_mcp_tool_name
 
 _ARTIFACT_RE = re.compile(
     r"<artifact(?:_patch)?\b[^>]*>.*?</artifact(?:_patch)?>",
@@ -201,6 +204,9 @@ async def _run_headless_sqlite(
         _execute_tool,
         _build_tools_for_llm,
         _build_memory_injection,
+        _load_mcp_server_configs,
+        _connect_mcp_servers,
+        _merge_tools,
         _SANDBOX_SYSTEM_HINT,
         _MEMORY_CAP,
         _TraceContext,
@@ -309,110 +315,129 @@ async def _run_headless_sqlite(
 
     full_content = ""
     trace = _TraceContext(session_id=session_id, db=db)
+    mcp_server_configs = _load_mcp_server_configs(agent, db)
 
-    for _round in range(MAX_TOOL_ROUNDS):
-        tool_calls_collected = []
-        round_content = ""
-        round_usage = {}
-        round_started = asyncio.get_running_loop().time()
-        stop_reason = None
+    async def _run_loop(mcp_conns: dict = None, mcp_tools: list = None):
+        nonlocal full_content
+        active_tools = _merge_tools(tools, mcp_tools or [])
 
-        async for chunk in llm.chat_stream(messages, system_prompt=system_prompt, tools=tools, response_schema=response_schema):
-            if chunk.type == "content":
-                full_content += chunk.content
-                round_content += chunk.content
-            elif chunk.type == "tool_call":
-                if chunk.tool_call:
-                    tool_calls_collected.append(chunk.tool_call)
-            elif chunk.type == "done":
-                round_usage = chunk.usage or {}
-                stop_reason = chunk.finish_reason
+        for _round in range(MAX_TOOL_ROUNDS):
+            tool_calls_collected = []
+            round_content = ""
+            round_usage = {}
+            round_started = asyncio.get_running_loop().time()
+            stop_reason = None
+
+            async for chunk in llm.chat_stream(messages, system_prompt=system_prompt, tools=active_tools, response_schema=response_schema):
+                if chunk.type == "content":
+                    full_content += chunk.content
+                    round_content += chunk.content
+                elif chunk.type == "tool_call":
+                    if chunk.tool_call:
+                        tool_calls_collected.append(chunk.tool_call)
+                elif chunk.type == "done":
+                    round_usage = chunk.usage or {}
+                    stop_reason = chunk.finish_reason
+                    break
+                elif chunk.type == "error":
+                    logger.error("agent_runner LLM error: %s", chunk.error)
+                    return _strip_artifacts(full_content) or None
+
+            trace.record_llm_span(
+                model_name=agent.model_id or provider_record.model_id or "unknown",
+                usage=round_usage,
+                duration_ms=int((asyncio.get_running_loop().time() - round_started) * 1000),
+                round_number=_round,
+                prompt_preview=(messages[-1].text_content if messages else ""),
+                response_preview=round_content,
+                stop_reason=stop_reason,
+            )
+
+            if not tool_calls_collected:
                 break
-            elif chunk.type == "error":
-                logger.error("agent_runner LLM error: %s", chunk.error)
-                return _strip_artifacts(full_content) or None
 
-        trace.record_llm_span(
-            model_name=agent.model_id or provider_record.model_id or "unknown",
-            usage=round_usage,
-            duration_ms=int((asyncio.get_running_loop().time() - round_started) * 1000),
-            round_number=_round,
-            prompt_preview=(messages[-1].text_content if messages else ""),
-            response_preview=round_content,
-            stop_reason=stop_reason,
-        )
+            messages.append(LLMMessage(role="assistant", content=full_content or ""))
 
-        if not tool_calls_collected:
-            break
-
-        messages.append(LLMMessage(role="assistant", content=full_content or ""))
-
-        for tc in tool_calls_collected:
-            if tc.name in ("create_tool", "edit_tool"):
-                messages.append(LLMMessage(
-                    role="user",
-                    content=f"[Tool proposals are not supported in channel mode.]\n\n{TOOL_RESULT_PROMPT}",
-                ))
-                continue
-
-            tool_def = _tool_hitl_map.get(tc.name)
-            if _needs_hitl(tc.name, tool_def, agent):
-                args_str = tc.arguments if isinstance(tc.arguments, str) else json.dumps(tc.arguments)
-                approval = HITLApproval(
-                    session_id=session_id,
-                    tool_call_id=tc.id,
-                    tool_name=tc.name,
-                    tool_arguments_json=args_str,
-                    status="pending",
-                )
-                db.add(approval)
-                db.commit()
-                db.refresh(approval)
-
-                event_key = f"{session_id}:{tc.id}"
-                hitl_event = asyncio.Event()
-                _hitl_events[event_key] = hitl_event
-
-                logger.info("agent_runner: HITL required for tool '%s' in session %s", tc.name, session_id)
-
-                from routers.chat_router import _wait_for_approval_or_db_poll
-                try:
-                    status = await _wait_for_approval_or_db_poll(hitl_event, str(approval.id), db=db)
-                finally:
-                    _hitl_events.pop(event_key, None)
-
-                if status == "denied":
+            for tc in tool_calls_collected:
+                if tc.name in ("create_tool", "edit_tool"):
                     messages.append(LLMMessage(
                         role="user",
-                        content=f"[Tool '{tc.name}' was denied by the user or timed out.]\n\n{TOOL_RESULT_PROMPT}",
+                        content=f"[Tool proposals are not supported in channel mode.]\n\n{TOOL_RESULT_PROMPT}",
                     ))
                     continue
 
-            _sandbox_cid = getattr(agent, "sandbox_container_id", None)
-            tool_started = asyncio.get_running_loop().time()
-            if is_builtin_tool(tc.name):
-                result = await execute_builtin_tool(tc.name, tc.arguments)
-            elif is_sandbox_tool(tc.name):
-                result = await execute_sandbox_tool(tc.name, tc.arguments, _sandbox_cid) if _sandbox_cid else json.dumps({"error": "Sandbox not running"})
-            else:
-                result = _execute_tool(tc.name, tc.arguments, db)
+                tool_def = _tool_hitl_map.get(tc.name)
+                if _needs_hitl(tc.name, tool_def, agent):
+                    args_str = tc.arguments if isinstance(tc.arguments, str) else json.dumps(tc.arguments)
+                    approval = HITLApproval(
+                        session_id=session_id,
+                        tool_call_id=tc.id,
+                        tool_name=tc.name,
+                        tool_arguments_json=args_str,
+                        status="pending",
+                    )
+                    db.add(approval)
+                    db.commit()
+                    db.refresh(approval)
 
-            trace.record_tool_span(
-                tc.name,
-                tc.arguments if isinstance(tc.arguments, str) else json.dumps(tc.arguments),
-                result,
-                int((asyncio.get_running_loop().time() - tool_started) * 1000),
-                round_number=_round,
-            )
+                    event_key = f"{session_id}:{tc.id}"
+                    hitl_event = asyncio.Event()
+                    _hitl_events[event_key] = hitl_event
 
-            messages.append(LLMMessage(
-                role="user",
-                content=f"[Tool '{tc.name}' returned: {result}]\n\n{TOOL_RESULT_PROMPT}",
-            ))
+                    logger.info("agent_runner: HITL required for tool '%s' in session %s", tc.name, session_id)
 
-        full_content = ""
+                    from routers.chat_router import _wait_for_approval_or_db_poll
+                    try:
+                        status = await _wait_for_approval_or_db_poll(hitl_event, str(approval.id), db=db)
+                    finally:
+                        _hitl_events.pop(event_key, None)
 
-    return _strip_artifacts(full_content) or None
+                    if status == "denied":
+                        messages.append(LLMMessage(
+                            role="user",
+                            content=f"[Tool '{tc.name}' was denied by the user or timed out.]\n\n{TOOL_RESULT_PROMPT}",
+                        ))
+                        continue
+
+                tool_started = asyncio.get_running_loop().time()
+                runtime = ToolRuntimeContext(
+                    session_id=str(session_id),
+                    agent_id=str(agent.id),
+                    db=db,
+                    sandbox_container_id=getattr(agent, "sandbox_container_id", None),
+                    mcp_connections=mcp_conns or {},
+                )
+                exec_res = await tool_executor.execute(tool_name=tc.name, arguments=tc.arguments, runtime=runtime)
+                result = exec_res.output
+
+                is_mcp = parse_mcp_tool_name(tc.name) is not None
+                span_type = "mcp_call" if is_mcp else "tool_call"
+
+                trace.record_tool_span(
+                    tc.name,
+                    tc.arguments if isinstance(tc.arguments, str) else json.dumps(tc.arguments),
+                    result,
+                    int((asyncio.get_running_loop().time() - tool_started) * 1000),
+                    round_number=_round,
+                    span_type=span_type,
+                    status="error" if exec_res.error else "success",
+                )
+
+                messages.append(LLMMessage(
+                    role="user",
+                    content=f"[Tool '{tc.name}' returned: {result}]\n\n{TOOL_RESULT_PROMPT}",
+                ))
+
+            full_content = ""
+
+        return _strip_artifacts(full_content) or None
+
+    if mcp_server_configs:
+        async with AsyncExitStack() as stack:
+            mcp_connections, all_mcp_tools = await _connect_mcp_servers(stack, mcp_server_configs)
+            return await _run_loop(mcp_conns=mcp_connections, mcp_tools=all_mcp_tools)
+    else:
+        return await _run_loop()
 
 
 # ── MongoDB ────────────────────────────────────────────────────────────────────
@@ -441,7 +466,11 @@ async def _run_headless_mongo(
         _needs_hitl,
         _execute_tool_mongo,
         _build_tools_for_llm_mongo,
+        _load_mcp_server_configs_mongo,
+        _connect_mcp_servers,
+        _merge_tools,
         _build_memory_injection_dicts,
+        _save_trace_span_mongo,
         _SANDBOX_SYSTEM_HINT,
         _MEMORY_CAP,
     )
@@ -559,6 +588,7 @@ async def _run_headless_mongo(
 
     full_content = ""
     trace_sequence = 0
+    mcp_server_configs = await _load_mcp_server_configs_mongo(agent, mongo_db)
 
     async def record_mongo_span(data: dict):
         nonlocal trace_sequence
@@ -566,113 +596,129 @@ async def _run_headless_mongo(
         trace_sequence += 1
         await _save_trace_span_mongo(mongo_db, data)
 
-    for _round in range(MAX_TOOL_ROUNDS):
-        tool_calls_collected = []
-        round_content = ""
-        round_usage = {}
-        round_started = asyncio.get_running_loop().time()
-        stop_reason = None
+    async def _run_loop_mongo(mcp_conns: dict = None, mcp_tools: list = None):
+        nonlocal full_content
+        active_tools = _merge_tools(tools, mcp_tools or [])
 
-        async for chunk in llm.chat_stream(messages, system_prompt=system_prompt, tools=tools, response_schema=response_schema):
-            if chunk.type == "content":
-                full_content += chunk.content
-                round_content += chunk.content
-            elif chunk.type == "tool_call":
-                if chunk.tool_call:
-                    tool_calls_collected.append(chunk.tool_call)
-            elif chunk.type == "done":
-                round_usage = chunk.usage or {}
-                stop_reason = chunk.finish_reason
-                break
-            elif chunk.type == "error":
-                logger.error("agent_runner mongo LLM error: %s", chunk.error)
-                return _strip_artifacts(full_content) or None
+        for _round in range(MAX_TOOL_ROUNDS):
+            tool_calls_collected = []
+            round_content = ""
+            round_usage = {}
+            round_started = asyncio.get_running_loop().time()
+            stop_reason = None
 
-        await record_mongo_span({
-            "session_id": session_id,
-            "span_type": "llm_call",
-            "name": agent.get("model_id") or provider_record.get("model_id") or "unknown",
-            "input_tokens": round_usage.get("input_tokens", 0),
-            "output_tokens": round_usage.get("output_tokens", 0),
-            "cache_read_tokens": round_usage.get("cache_read_input_tokens", 0) or 0,
-            "cache_creation_tokens": round_usage.get("cache_creation_input_tokens", 0) or 0,
-            "duration_ms": int((asyncio.get_running_loop().time() - round_started) * 1000),
-            "status": "success",
-            "stop_reason": stop_reason,
-            "input_data": json.dumps({"prompt_preview": (messages[-1].text_content if messages else "")[:5000]}),
-            "output_data": json.dumps({"response_preview": round_content[:5000]}),
-            "round_number": _round,
-        })
-
-        if not tool_calls_collected:
-            break
-
-        messages.append(LLMMessage(role="assistant", content=full_content or ""))
-
-        for tc in tool_calls_collected:
-            if tc.name in ("create_tool", "edit_tool"):
-                messages.append(LLMMessage(
-                    role="user",
-                    content=f"[Tool proposals are not supported in channel mode.]\n\n{TOOL_RESULT_PROMPT}",
-                ))
-                continue
-
-            tool_def = _tool_hitl_map.get(tc.name)
-            if _needs_hitl(tc.name, tool_def, agent):
-                args_str = tc.arguments if isinstance(tc.arguments, str) else json.dumps(tc.arguments)
-                approval = await HITLApprovalCollection.create(mongo_db, {
-                    "session_id": session_id,
-                    "tool_call_id": tc.id,
-                    "tool_name": tc.name,
-                    "tool_arguments_json": args_str,
-                    "status": "pending",
-                })
-                approval_id = str(approval["_id"])
-
-                event_key = f"{session_id}:{tc.id}"
-                hitl_event = asyncio.Event()
-                _hitl_events[event_key] = hitl_event
-
-                logger.info("agent_runner: HITL required for tool '%s' in session %s", tc.name, session_id)
-
-                from routers.chat_router import _wait_for_approval_or_db_poll
-                try:
-                    status = await _wait_for_approval_or_db_poll(hitl_event, approval_id, mongo_db=mongo_db)
-                finally:
-                    _hitl_events.pop(event_key, None)
-
-                if status == "denied":
-                    messages.append(LLMMessage(
-                        role="user",
-                        content=f"[Tool '{tc.name}' was denied or timed out.]\n\n{TOOL_RESULT_PROMPT}",
-                    ))
-                    continue
-
-            _sandbox_cid = agent.get("sandbox_container_id")
-            tool_started = asyncio.get_running_loop().time()
-            if is_builtin_tool(tc.name):
-                result = await execute_builtin_tool(tc.name, tc.arguments)
-            elif is_sandbox_tool(tc.name):
-                result = await execute_sandbox_tool(tc.name, tc.arguments, _sandbox_cid) if _sandbox_cid else json.dumps({"error": "Sandbox not running"})
-            else:
-                result = await _execute_tool_mongo(tc.name, tc.arguments, mongo_db, user_id=_user_id, session_id=session_id)
+            async for chunk in llm.chat_stream(messages, system_prompt=system_prompt, tools=active_tools, response_schema=response_schema):
+                if chunk.type == "content":
+                    full_content += chunk.content
+                    round_content += chunk.content
+                elif chunk.type == "tool_call":
+                    if chunk.tool_call:
+                        tool_calls_collected.append(chunk.tool_call)
+                elif chunk.type == "done":
+                    round_usage = chunk.usage or {}
+                    stop_reason = chunk.finish_reason
+                    break
+                elif chunk.type == "error":
+                    logger.error("agent_runner mongo LLM error: %s", chunk.error)
+                    return _strip_artifacts(full_content) or None
 
             await record_mongo_span({
                 "session_id": session_id,
-                "span_type": "tool_call",
-                "name": tc.name,
-                "duration_ms": int((asyncio.get_running_loop().time() - tool_started) * 1000),
+                "span_type": "llm_call",
+                "name": agent.get("model_id") or provider_record.get("model_id") or "unknown",
+                "input_tokens": round_usage.get("input_tokens", 0),
+                "output_tokens": round_usage.get("output_tokens", 0),
+                "cache_read_tokens": round_usage.get("cache_read_input_tokens", 0) or 0,
+                "cache_creation_tokens": round_usage.get("cache_creation_input_tokens", 0) or 0,
+                "duration_ms": int((asyncio.get_running_loop().time() - round_started) * 1000),
                 "status": "success",
-                "input_data": json.dumps({"arguments": tc.arguments if isinstance(tc.arguments, str) else json.dumps(tc.arguments)})[:5000],
-                "output_data": json.dumps({"result": str(result)[:5000]}),
+                "stop_reason": stop_reason,
+                "input_data": json.dumps({"prompt_preview": (messages[-1].text_content if messages else "")[:5000]}),
+                "output_data": json.dumps({"response_preview": round_content[:5000]}),
                 "round_number": _round,
             })
 
-            messages.append(LLMMessage(
-                role="user",
-                content=f"[Tool '{tc.name}' returned: {result}]\n\n{TOOL_RESULT_PROMPT}",
-            ))
+            if not tool_calls_collected:
+                break
 
-        full_content = ""
+            messages.append(LLMMessage(role="assistant", content=full_content or ""))
 
-    return _strip_artifacts(full_content) or None
+            for tc in tool_calls_collected:
+                if tc.name in ("create_tool", "edit_tool"):
+                    messages.append(LLMMessage(
+                        role="user",
+                        content=f"[Tool proposals are not supported in channel mode.]\n\n{TOOL_RESULT_PROMPT}",
+                    ))
+                    continue
+
+                tool_def = _tool_hitl_map.get(tc.name)
+                if _needs_hitl(tc.name, tool_def, agent):
+                    args_str = tc.arguments if isinstance(tc.arguments, str) else json.dumps(tc.arguments)
+                    approval = await HITLApprovalCollection.create(mongo_db, {
+                        "session_id": session_id,
+                        "tool_call_id": tc.id,
+                        "tool_name": tc.name,
+                        "tool_arguments_json": args_str,
+                        "status": "pending",
+                    })
+                    approval_id = str(approval["_id"])
+
+                    event_key = f"{session_id}:{tc.id}"
+                    hitl_event = asyncio.Event()
+                    _hitl_events[event_key] = hitl_event
+
+                    logger.info("agent_runner: HITL required for tool '%s' in session %s", tc.name, session_id)
+
+                    from routers.chat_router import _wait_for_approval_or_db_poll
+                    try:
+                        status = await _wait_for_approval_or_db_poll(hitl_event, approval_id, mongo_db=mongo_db)
+                    finally:
+                        _hitl_events.pop(event_key, None)
+
+                    if status == "denied":
+                        messages.append(LLMMessage(
+                            role="user",
+                            content=f"[Tool '{tc.name}' was denied or timed out.]\n\n{TOOL_RESULT_PROMPT}",
+                        ))
+                        continue
+
+                tool_started = asyncio.get_running_loop().time()
+                runtime = ToolRuntimeContext(
+                    session_id=str(session_id),
+                    agent_id=str(agent_id),
+                    mongo_db=mongo_db,
+                    sandbox_container_id=agent.get("sandbox_container_id"),
+                    mcp_connections=mcp_conns or {},
+                )
+                exec_res = await tool_executor.execute(tool_name=tc.name, arguments=tc.arguments, runtime=runtime)
+                result = exec_res.output
+
+                is_mcp = parse_mcp_tool_name(tc.name) is not None
+                span_type = "mcp_call" if is_mcp else "tool_call"
+
+                await record_mongo_span({
+                    "session_id": session_id,
+                    "span_type": span_type,
+                    "name": tc.name,
+                    "duration_ms": int((asyncio.get_running_loop().time() - tool_started) * 1000),
+                    "status": "error" if exec_res.error else "success",
+                    "input_data": json.dumps({"arguments": tc.arguments if isinstance(tc.arguments, str) else json.dumps(tc.arguments)})[:5000],
+                    "output_data": json.dumps({"result": str(result)[:5000]}),
+                    "round_number": _round,
+                })
+
+                messages.append(LLMMessage(
+                    role="user",
+                    content=f"[Tool '{tc.name}' returned: {result}]\n\n{TOOL_RESULT_PROMPT}",
+                ))
+
+            full_content = ""
+
+        return _strip_artifacts(full_content) or None
+
+    if mcp_server_configs:
+        async with AsyncExitStack() as stack:
+            mcp_connections, all_mcp_tools = await _connect_mcp_servers(stack, mcp_server_configs)
+            return await _run_loop_mongo(mcp_conns=mcp_connections, mcp_tools=all_mcp_tools)
+    else:
+        return await _run_loop_mongo()
