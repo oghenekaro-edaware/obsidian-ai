@@ -103,16 +103,69 @@ def test_execute_tool_http_redirect_and_dynamic_url():
     mock_db = MagicMock()
     mock_db.query().filter().first.return_value = DummyToolDef()
 
+    with patch("socket.getaddrinfo") as mock_dns:
+        mock_dns.return_value = [(2, 1, 6, '', ('93.184.216.34', 443))]
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client_cls.return_value.__enter__.return_value = mock_client
+            mock_resp = MagicMock()
+            mock_resp.text = "<html>Google</html>"
+            mock_client.get.return_value = mock_resp
+
+            args = json.dumps({"url": "https://www.google.com/", "method": "GET"})
+            res = _execute_tool("http_request_2", args, mock_db)
+
+            assert res == "<html>Google</html>"
+            mock_client_cls.assert_called_once_with(timeout=30.0, follow_redirects=True)
+            mock_client.get.assert_called_once_with("https://www.google.com/", params=None, headers={})
+
+
+def test_ssrf_blocking_private_ips():
+    class DummyToolDef:
+        handler_type = "http"
+        handler_config = json.dumps({"url": "http://127.0.0.1/admin", "method": "GET"})
+
+    mock_db = MagicMock()
+    mock_db.query().filter().first.return_value = DummyToolDef()
+
+    res = _execute_tool("ssrf_test", "", mock_db)
+    data = json.loads(res)
+    assert "error" in data
+    assert "SSRF blocked" in data["error"] or "blocked for security reasons" in data["error"]
+
+
+def test_ssrf_allow_private_networks_override(monkeypatch):
+    monkeypatch.setenv("ALLOW_PRIVATE_NETWORKS", "true")
+
+    class DummyToolDef:
+        handler_type = "http"
+        handler_config = json.dumps({"url": "http://127.0.0.1/admin", "method": "GET"})
+
+    mock_db = MagicMock()
+    mock_db.query().filter().first.return_value = DummyToolDef()
+
     with patch("httpx.Client") as mock_client_cls:
         mock_client = MagicMock()
         mock_client_cls.return_value.__enter__.return_value = mock_client
         mock_resp = MagicMock()
-        mock_resp.text = "<html>Google</html>"
+        mock_resp.text = "ok"
         mock_client.get.return_value = mock_resp
 
-        args = json.dumps({"url": "https://www.google.com/", "method": "GET"})
-        res = _execute_tool("http_request_2", args, mock_db)
+        res = _execute_tool("ssrf_test", "", mock_db)
+        assert res == "ok"
 
-        assert res == "<html>Google</html>"
-        mock_client_cls.assert_called_once_with(timeout=30.0, follow_redirects=True)
-        mock_client.get.assert_called_once_with("https://www.google.com/", params=None, headers={})
+
+def test_dns_resolution_failure_handling():
+    class DummyToolDef:
+        handler_type = "http"
+        handler_config = json.dumps({"url": "https://nonexistent-domain-xyz-1234.com/api", "method": "GET"})
+
+    mock_db = MagicMock()
+    mock_db.query().filter().first.return_value = DummyToolDef()
+
+    import socket
+    with patch("socket.getaddrinfo", side_effect=socket.gaierror(-5, "No address associated with hostname")):
+        res = _execute_tool("dns_test", "", mock_db)
+        data = json.loads(res)
+        assert "error" in data
+        assert "DNS resolution failed" in data["error"] or "No address associated with hostname" in data["error"]

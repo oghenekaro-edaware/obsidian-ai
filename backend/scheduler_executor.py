@@ -468,25 +468,12 @@ def _execute_tool_sqlite(tool_name: str, arguments_str: str, db) -> str:
         config = json.loads(tool_def.handler_config) if tool_def.handler_config else {}
         return _exec_python_tool(config.get("code") or "", arguments)
     elif handler_type == "http":
-        import httpx
+        from routers.chat_router import _execute_http_request_sync
         config = json.loads(tool_def.handler_config) if tool_def.handler_config else {}
         url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, tool_name)
         if not url:
             return json.dumps({"error": "No URL configured"})
-        try:
-            with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-                if method == "GET":
-                    resp = client.get(url, params=params, headers=headers)
-                else:
-                    if isinstance(body, (dict, list)):
-                        resp = client.request(method, url, json=body, headers=headers)
-                    elif body is not None:
-                        resp = client.request(method, url, content=str(body), headers=headers)
-                    else:
-                        resp = client.request(method, url, headers=headers)
-                return resp.text
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+        return _execute_http_request_sync(method, url, headers, params, body)
     return json.dumps({"error": f"Unsupported handler type: {tool_def.handler_type}"})
 
 
@@ -893,24 +880,11 @@ async def _execute_tool_mongo_native(tool_name: str, arguments_str: str, mongo_d
     if handler_type == "python":
         return _exec_python_tool(config.get("code") or "", arguments)
     elif handler_type == "http":
-        import httpx
+        from routers.chat_router import _execute_http_request_async
         url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, tool_name)
         if not url:
             return json.dumps({"error": "No URL configured"})
-        try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                if method == "GET":
-                    resp = await client.get(url, params=params, headers=headers)
-                else:
-                    if isinstance(body, (dict, list)):
-                        resp = await client.request(method, url, json=body, headers=headers)
-                    elif body is not None:
-                        resp = await client.request(method, url, content=str(body), headers=headers)
-                    else:
-                        resp = await client.request(method, url, headers=headers)
-                return resp.text
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+        return await _execute_http_request_async(method, url, headers, params, body)
     return json.dumps({"error": f"Unsupported handler type: {handler_type}"})
 
 
@@ -958,24 +932,11 @@ async def _chat_non_streaming_mongo(llm, messages, system_prompt, tools, mcp_con
         if handler_type == "python":
             return _exec_python_tool(config.get("code") or "", arguments)
         elif handler_type == "http":
-            import httpx
+            from routers.chat_router import _execute_http_request_async
             url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, tc_name)
             if not url:
                 return json.dumps({"error": "No URL configured"})
-            try:
-                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                    if method == "GET":
-                        resp = await client.get(url, params=params, headers=headers)
-                    else:
-                        if isinstance(body, (dict, list)):
-                            resp = await client.request(method, url, json=body, headers=headers)
-                        elif body is not None:
-                            resp = await client.request(method, url, content=str(body), headers=headers)
-                        else:
-                            resp = await client.request(method, url, headers=headers)
-                    return resp.text
-            except Exception as e:
-                return json.dumps({"error": str(e)})
+            return await _execute_http_request_async(method, url, headers, params, body)
         return json.dumps({"error": f"Unsupported handler type: {handler_type}"})
 
     mcp_connections = {}
