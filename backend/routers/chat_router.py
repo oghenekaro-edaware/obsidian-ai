@@ -25,6 +25,7 @@ from async_job_tools import SCHEDULE_ASYNC_CHECK_TOOL_SCHEMA, is_async_job_tool,
 from builtin_tools import execute_builtin_tool, is_builtin_tool
 from agent_framework import function_middleware, FunctionInvocationContext, FunctionTool
 from services.schema_validation_service import validate_json_schema
+from services.tool_executor import tool_executor, ToolRuntimeContext
 
 if DATABASE_TYPE == "mongo":
     from database_mongo import get_database
@@ -1567,7 +1568,7 @@ def _merge_tools(native_tools: list[dict] | None, mcp_tools: list[dict]) -> list
     return all_tools if all_tools else None
 
 
-def _to_maf_tools(tools: list | None, db, sandbox_container_id: str | None = None) -> list[FunctionTool] | None:
+def _to_maf_tools(tools: list | None, db=None, sandbox_container_id: str | None = None) -> list[FunctionTool] | None:
     """Convert OpenAI-style schemas into executable tools for MAF Agent.run."""
     if not tools:
         return None
@@ -1588,14 +1589,19 @@ def _to_maf_tools(tools: list | None, db, sandbox_container_id: str | None = Non
         input_model = function.get("parameters") or {"type": "object", "properties": {}}
 
         def _make_handler(tool_name):
-            async def handler(**kwargs):
-                return await _execute_mcp_or_native_tool(
-                    tool_name,
-                    json.dumps(kwargs),
-                    {},
-                    db,
-                    sandbox_container_id,
+            async def handler(ctx: FunctionInvocationContext, **kwargs):
+                runtime_kwargs = getattr(ctx, "kwargs", {}) or {}
+                runtime_ctx = ToolRuntimeContext.from_dict_or_context({
+                    "db": db,
+                    "sandbox_container_id": sandbox_container_id,
+                    **runtime_kwargs,
+                })
+                res = await tool_executor.execute(
+                    tool_name=tool_name,
+                    arguments=kwargs,
+                    runtime=runtime_ctx,
                 )
+                return res.output
             return handler
 
         maf_tools.append(FunctionTool(
@@ -1613,26 +1619,17 @@ async def _execute_mcp_or_native_tool(
     sandbox_container_id: str | None = None,
 ) -> str:
     """Route a tool call to either a builtin, sandbox, MCP server, or native tool handler."""
-    if is_builtin_tool(tc_name):
-        return await execute_builtin_tool(tc_name, tc_arguments)
-    if is_sandbox_tool(tc_name):
-        if not sandbox_container_id:
-            return json.dumps({"error": "Sandbox is not running for this agent"})
-        return await execute_sandbox_tool(tc_name, tc_arguments, sandbox_container_id)
-    parsed = parse_mcp_tool_name(tc_name)
-    if parsed:
-        server_name, original_tool_name = parsed
-        conn = mcp_connections.get(server_name)
-        if conn:
-            try:
-                args = json.loads(tc_arguments) if tc_arguments else {}
-            except json.JSONDecodeError:
-                args = {}
-            return await conn.call_tool(original_tool_name, args)
-        else:
-            return json.dumps({"error": f"MCP server '{server_name}' not connected"})
-    else:
-        return _execute_tool(tc_name, tc_arguments, db)
+    runtime = ToolRuntimeContext(
+        db=db,
+        sandbox_container_id=sandbox_container_id,
+        mcp_connections=mcp_connections or {},
+    )
+    res = await tool_executor.execute(
+        tool_name=tc_name,
+        arguments=tc_arguments,
+        runtime=runtime,
+    )
+    return res.output
 
 
 async def _execute_mcp_or_native_tool_mongo(
@@ -1640,26 +1637,17 @@ async def _execute_mcp_or_native_tool_mongo(
     sandbox_container_id: str | None = None,
 ) -> str:
     """Route a tool call to either a builtin, sandbox, MCP server, or native tool handler (MongoDB)."""
-    if is_builtin_tool(tc_name):
-        return await execute_builtin_tool(tc_name, tc_arguments)
-    if is_sandbox_tool(tc_name):
-        if not sandbox_container_id:
-            return json.dumps({"error": "Sandbox is not running for this agent"})
-        return await execute_sandbox_tool(tc_name, tc_arguments, sandbox_container_id)
-    parsed = parse_mcp_tool_name(tc_name)
-    if parsed:
-        server_name, original_tool_name = parsed
-        conn = mcp_connections.get(server_name)
-        if conn:
-            try:
-                args = json.loads(tc_arguments) if tc_arguments else {}
-            except json.JSONDecodeError:
-                args = {}
-            return await conn.call_tool(original_tool_name, args)
-        else:
-            return json.dumps({"error": f"MCP server '{server_name}' not connected"})
-    else:
-        return await _execute_tool_mongo(tc_name, tc_arguments, mongo_db)
+    runtime = ToolRuntimeContext(
+        mongo_db=mongo_db,
+        sandbox_container_id=sandbox_container_id,
+        mcp_connections=mcp_connections or {},
+    )
+    res = await tool_executor.execute(
+        tool_name=tc_name,
+        arguments=tc_arguments,
+        runtime=runtime,
+    )
+    return res.output
 
 
 async def _connect_mcp_servers(stack: AsyncExitStack, mcp_server_configs: list[dict]) -> tuple[dict[str, MCPConnection], list[dict]]:
@@ -2781,6 +2769,8 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
             "llm": llm,
             "tool_hitl_map": _tool_hitl_map,
             "sandbox_container_id_override": sandbox_container_id_override,
+            "sandbox_container_id": sandbox_container_id_override,
+            "mcp_connections": mcp_connections if "mcp_connections" in locals() else {},
         }
 
         try:
