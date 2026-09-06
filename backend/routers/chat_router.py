@@ -1330,14 +1330,92 @@ async def _execute_http_request_async(method: str, url: str, headers: dict, para
         return json.dumps({"error": f"HTTP request failed: {e}"})
 
 
+def _parse_curl_command(curl_str: str) -> tuple[str | None, str | None, dict, Any]:
+    """Parse a curl command string and extract (url, method, headers, body)."""
+    import shlex
+    idx = curl_str.find("curl")
+    if idx == -1:
+        return None, None, {}, None
+
+    curl_cmd = curl_str[idx:]
+    try:
+        tokens = shlex.split(curl_cmd)
+    except Exception:
+        return None, None, {}, None
+
+    if not tokens or tokens[0] != "curl":
+        return None, None, {}, None
+
+    url = None
+    method = None
+    headers = {}
+    data_parts = []
+
+    i = 1
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok in ("-X", "--request") and i + 1 < n:
+            method = tokens[i + 1].upper()
+            i += 2
+        elif tok in ("-H", "--header") and i + 1 < n:
+            header_str = tokens[i + 1]
+            if ":" in header_str:
+                k, v = header_str.split(":", 1)
+                headers[k.strip()] = v.strip()
+            i += 2
+        elif tok in ("-d", "--data", "--data-raw", "--data-binary", "--data-ascii", "--data-urlencode", "--json") and i + 1 < n:
+            data_parts.append(tokens[i + 1])
+            if tok == "--json" and "Content-Type" not in headers and "content-type" not in [h.lower() for h in headers]:
+                headers["Content-Type"] = "application/json"
+            i += 2
+        elif tok.startswith("-"):
+            i += 1
+        else:
+            if not url and (tok.startswith("http://") or tok.startswith("https://") or "://" in tok or "." in tok):
+                url = tok
+            i += 1
+
+    if not method and data_parts:
+        method = "POST"
+
+    body = None
+    if data_parts:
+        raw_body = "&".join(data_parts) if len(data_parts) > 1 else data_parts[0]
+        try:
+            body = json.loads(raw_body)
+        except Exception:
+            body = raw_body
+
+    return url, method, headers, body
+
+
 def _resolve_http_tool_request_params(config: dict, arguments: dict, tool_name: str = "") -> tuple[str, str, dict, dict | None, Any]:
     """
     Resolve URL, method, headers, params, and body for an HTTP tool call.
     Allows runtime arguments (url, endpoint, method, headers, body, data) to override or format handler_config.
+    Also parses curl commands if provided in tool arguments.
     """
-    url = arguments.get("url") or arguments.get("endpoint") or config.get("url", "")
+    # Check if arguments or any argument value contains a curl command
+    curl_str = None
+    curl_arg_key = None
+    if isinstance(arguments, dict):
+        for k, v in arguments.items():
+            if isinstance(v, str) and "curl" in v:
+                curl_str = v
+                curl_arg_key = k
+                break
+
+    curl_url, curl_method, curl_headers, curl_body = (None, None, {}, None)
+    if curl_str:
+        curl_url, curl_method, curl_headers, curl_body = _parse_curl_command(curl_str)
+
+    url = arguments.get("url") or arguments.get("endpoint") or curl_url or config.get("url", "")
     config_url = config.get("url", "")
     used_keys = set()
+    if curl_arg_key:
+        used_keys.add(curl_arg_key)
+
     if "{" in config_url and "}" in config_url:
         try:
             url = config_url.format(**arguments)
@@ -1347,13 +1425,15 @@ def _resolve_http_tool_request_params(config: dict, arguments: dict, tool_name: 
         except Exception:
             pass
 
-    raw_method = arguments.get("method") or config.get("method")
+    raw_method = arguments.get("method") or curl_method or config.get("method")
     if not raw_method:
         tn = (tool_name or "").lower()
         raw_method = "GET" if any(k in tn for k in ("get", "search", "fetch", "query", "list", "find")) else "POST"
     method = str(raw_method).upper()
 
     headers = dict(config.get("headers") or {})
+    if curl_headers:
+        headers.update(curl_headers)
     if isinstance(arguments.get("headers"), dict):
         headers.update(arguments["headers"])
 
@@ -1362,18 +1442,19 @@ def _resolve_http_tool_request_params(config: dict, arguments: dict, tool_name: 
         if k not in ("url", "endpoint", "method", "headers") and k not in used_keys
     }
 
-    body = None
+    body = curl_body
     params = None
 
     if method == "GET":
         params = payload_args if payload_args else None
     else:
-        if "body" in payload_args and len(payload_args) == 1:
-            body = payload_args["body"]
-        elif "data" in payload_args and len(payload_args) == 1:
-            body = payload_args["data"]
-        elif payload_args:
-            body = payload_args
+        if body is None:
+            if "body" in payload_args and len(payload_args) == 1:
+                body = payload_args["body"]
+            elif "data" in payload_args and len(payload_args) == 1:
+                body = payload_args["data"]
+            elif payload_args:
+                body = payload_args
 
     return url, method, headers, params, body
 

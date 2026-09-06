@@ -50,6 +50,22 @@ def test_resolve_http_tool_request_params_post_body():
     assert body == {"name": "jules", "action": "run"}
 
 
+def test_resolve_http_tool_request_params_curl_command():
+    config = {}
+    arguments = {
+        "query": "test this endpint\ncurl -X 'POST' \\\n  'https://agents-backend.smartbrainsvisuals.com.ng/auth/register' \\\n  -H 'accept: application/json' \\\n  -H 'Content-Type: application/json' \\\n  -d '{\n  \"encrypted\": \"string\"\n}'"
+    }
+
+    url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, "http_request_2")
+
+    assert url == "https://agents-backend.smartbrainsvisuals.com.ng/auth/register"
+    assert method == "POST"
+    assert headers.get("accept") == "application/json" or headers.get("Accept") == "application/json"
+    assert headers.get("Content-Type") == "application/json"
+    assert params is None
+    assert body == {"encrypted": "string"}
+
+
 def test_extract_usage_tokens():
     # Dictionary
     assert _extract_usage_tokens({"input_tokens": 100, "output_tokens": 50}) == (100, 50)
