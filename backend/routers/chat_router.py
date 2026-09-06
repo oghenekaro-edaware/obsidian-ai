@@ -17,7 +17,7 @@ from auth import get_current_user, TokenData
 from encryption import decrypt_api_key
 from llm.base import LLMMessage, LLMToolCall, to_maf_messages
 from llm.provider_factory import create_provider_from_config
-from mcp_client import connect_mcp_server, parse_mcp_tool_name, MCPConnection
+from mcp_client import connect_mcp_server, parse_mcp_tool_name, MCPConnection, MCPManager
 from file_storage import FileStorageService
 from rag_service import RAGService
 from sandbox_tools import SANDBOX_TOOL_SCHEMAS, execute_sandbox_tool, is_sandbox_tool
@@ -25,6 +25,8 @@ from async_job_tools import SCHEDULE_ASYNC_CHECK_TOOL_SCHEMA, is_async_job_tool,
 from builtin_tools import execute_builtin_tool, is_builtin_tool
 from agent_framework import function_middleware, FunctionInvocationContext, FunctionTool
 from services.schema_validation_service import validate_json_schema
+from services.tool_executor import tool_executor, ToolRuntimeContext
+from services.event_mapper import EventMapper
 
 if DATABASE_TYPE == "mongo":
     from database_mongo import get_database
@@ -53,6 +55,61 @@ _session_dynamic_tools: dict[str, set] = {}
 
 
 DEFAULT_APPROVAL_TIMEOUT_SECONDS = 600.0
+
+
+async def _wait_for_approval_or_db_poll(
+    evt: asyncio.Event | None,
+    approval_id: str | None,
+    db: Any | None = None,
+    mongo_db: Any | None = None,
+    timeout: float = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+    poll_interval: float = 0.5,
+) -> str:
+    """Wait for HITL approval via in-memory asyncio.Event with persistent DB status polling fallback."""
+    start_time = time.time()
+    while (time.time() - start_time) < timeout:
+        if evt and evt.is_set():
+            break
+
+        status = None
+        if mongo_db and approval_id:
+            doc = await HITLApprovalCollection.find_by_id(mongo_db, approval_id)
+            if doc:
+                status = doc.get("status")
+        elif db and approval_id and str(approval_id).isdigit():
+            rec = db.query(HITLApproval).filter(HITLApproval.id == int(approval_id)).first()
+            if rec:
+                status = rec.status
+
+        if status in ("approved", "denied", "rejected"):
+            return "denied" if status in ("denied", "rejected") else "approved"
+
+        if evt:
+            try:
+                await asyncio.wait_for(asyncio.shield(evt.wait()), timeout=poll_interval)
+                break
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(poll_interval)
+
+    if mongo_db and approval_id:
+        doc = await HITLApprovalCollection.find_by_id(mongo_db, approval_id)
+        st = doc.get("status") if doc else None
+        if st in ("approved", "denied", "rejected"):
+            return "denied" if st in ("denied", "rejected") else "approved"
+        await HITLApprovalCollection.update_status(mongo_db, approval_id, "denied")
+        return "denied"
+    elif db and approval_id and str(approval_id).isdigit():
+        rec = db.query(HITLApproval).filter(HITLApproval.id == int(approval_id)).first()
+        if rec and rec.status in ("approved", "denied", "rejected"):
+            return "denied" if rec.status in ("denied", "rejected") else "approved"
+        if rec:
+            rec.status = "denied"
+            db.commit()
+        return "denied"
+
+    return "denied"
 
 
 @function_middleware
@@ -221,28 +278,11 @@ async def hitl_and_proposal_middleware(ctx: FunctionInvocationContext, call_next
             await event_queue.put({"event": "hitl_required", "data": json.dumps(hitl_payload)})
 
         try:
-            await asyncio.wait_for(evt.wait(), timeout=DEFAULT_APPROVAL_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            if mongo_db and approval_id:
-                await HITLApprovalCollection.update_status(mongo_db, approval_id, "denied")
-            elif db and approval_id and approval_id.isdigit():
-                rec = db.query(HITLApproval).filter(HITLApproval.id == int(approval_id)).first()
-                if rec:
-                    rec.status = "denied"
-                    db.commit()
-            return f"User denied execution of tool '{tool_name}' (approval timeout)."
+            status = await _wait_for_approval_or_db_poll(evt, approval_id, db=db, mongo_db=mongo_db)
         finally:
             _hitl_events.pop(event_key, None)
             if approval_id:
                 _hitl_events.pop(approval_id, None)
-
-        status = "denied"
-        if mongo_db and approval_id:
-            refreshed = await HITLApprovalCollection.find_by_id(mongo_db, approval_id)
-            status = refreshed.get("status") if refreshed else "denied"
-        elif db and approval_id and approval_id.isdigit():
-            rec = db.query(HITLApproval).filter(HITLApproval.id == int(approval_id)).first()
-            status = rec.status if rec else "denied"
 
         if status == "denied":
             return f"User denied execution of tool '{tool_name}'."
@@ -1567,7 +1607,7 @@ def _merge_tools(native_tools: list[dict] | None, mcp_tools: list[dict]) -> list
     return all_tools if all_tools else None
 
 
-def _to_maf_tools(tools: list | None, db, sandbox_container_id: str | None = None) -> list[FunctionTool] | None:
+def _to_maf_tools(tools: list | None, db=None, sandbox_container_id: str | None = None) -> list[FunctionTool] | None:
     """Convert OpenAI-style schemas into executable tools for MAF Agent.run."""
     if not tools:
         return None
@@ -1588,14 +1628,19 @@ def _to_maf_tools(tools: list | None, db, sandbox_container_id: str | None = Non
         input_model = function.get("parameters") or {"type": "object", "properties": {}}
 
         def _make_handler(tool_name):
-            async def handler(**kwargs):
-                return await _execute_mcp_or_native_tool(
-                    tool_name,
-                    json.dumps(kwargs),
-                    {},
-                    db,
-                    sandbox_container_id,
+            async def handler(ctx: FunctionInvocationContext, **kwargs):
+                runtime_kwargs = getattr(ctx, "kwargs", {}) or {}
+                runtime_ctx = ToolRuntimeContext.from_dict_or_context({
+                    "db": db,
+                    "sandbox_container_id": sandbox_container_id,
+                    **runtime_kwargs,
+                })
+                res = await tool_executor.execute(
+                    tool_name=tool_name,
+                    arguments=kwargs,
+                    runtime=runtime_ctx,
                 )
+                return res.output
             return handler
 
         maf_tools.append(FunctionTool(
@@ -1612,68 +1657,42 @@ async def _execute_mcp_or_native_tool(
     tc_name: str, tc_arguments: str, mcp_connections: dict[str, MCPConnection], db,
     sandbox_container_id: str | None = None,
 ) -> str:
-    """Route a tool call to either a builtin, sandbox, MCP server, or native tool handler."""
-    if is_builtin_tool(tc_name):
-        return await execute_builtin_tool(tc_name, tc_arguments)
-    if is_sandbox_tool(tc_name):
-        if not sandbox_container_id:
-            return json.dumps({"error": "Sandbox is not running for this agent"})
-        return await execute_sandbox_tool(tc_name, tc_arguments, sandbox_container_id)
-    parsed = parse_mcp_tool_name(tc_name)
-    if parsed:
-        server_name, original_tool_name = parsed
-        conn = mcp_connections.get(server_name)
-        if conn:
-            try:
-                args = json.loads(tc_arguments) if tc_arguments else {}
-            except json.JSONDecodeError:
-                args = {}
-            return await conn.call_tool(original_tool_name, args)
-        else:
-            return json.dumps({"error": f"MCP server '{server_name}' not connected"})
-    else:
-        return _execute_tool(tc_name, tc_arguments, db)
+    """[DEPRECATED] Direct calls to tool_executor.execute should be preferred."""
+    runtime = ToolRuntimeContext(
+        db=db,
+        sandbox_container_id=sandbox_container_id,
+        mcp_connections=mcp_connections or {},
+    )
+    res = await tool_executor.execute(
+        tool_name=tc_name,
+        arguments=tc_arguments,
+        runtime=runtime,
+    )
+    return res.output
 
 
 async def _execute_mcp_or_native_tool_mongo(
     tc_name: str, tc_arguments: str, mcp_connections: dict[str, MCPConnection], mongo_db,
     sandbox_container_id: str | None = None,
 ) -> str:
-    """Route a tool call to either a builtin, sandbox, MCP server, or native tool handler (MongoDB)."""
-    if is_builtin_tool(tc_name):
-        return await execute_builtin_tool(tc_name, tc_arguments)
-    if is_sandbox_tool(tc_name):
-        if not sandbox_container_id:
-            return json.dumps({"error": "Sandbox is not running for this agent"})
-        return await execute_sandbox_tool(tc_name, tc_arguments, sandbox_container_id)
-    parsed = parse_mcp_tool_name(tc_name)
-    if parsed:
-        server_name, original_tool_name = parsed
-        conn = mcp_connections.get(server_name)
-        if conn:
-            try:
-                args = json.loads(tc_arguments) if tc_arguments else {}
-            except json.JSONDecodeError:
-                args = {}
-            return await conn.call_tool(original_tool_name, args)
-        else:
-            return json.dumps({"error": f"MCP server '{server_name}' not connected"})
-    else:
-        return await _execute_tool_mongo(tc_name, tc_arguments, mongo_db)
+    """[DEPRECATED] Direct calls to tool_executor.execute should be preferred."""
+    runtime = ToolRuntimeContext(
+        mongo_db=mongo_db,
+        sandbox_container_id=sandbox_container_id,
+        mcp_connections=mcp_connections or {},
+    )
+    res = await tool_executor.execute(
+        tool_name=tc_name,
+        arguments=tc_arguments,
+        runtime=runtime,
+    )
+    return res.output
 
 
 async def _connect_mcp_servers(stack: AsyncExitStack, mcp_server_configs: list[dict]) -> tuple[dict[str, MCPConnection], list[dict]]:
-    """Connect to all MCP servers using an AsyncExitStack. Returns (connections_map, all_mcp_tools)."""
-    mcp_connections: dict[str, MCPConnection] = {}
-    all_mcp_tools: list[dict] = []
-    for config in mcp_server_configs:
-        try:
-            conn = await stack.enter_async_context(connect_mcp_server(config))
-            mcp_connections[conn.server_name] = conn
-            all_mcp_tools.extend(conn.tools)
-        except Exception as e:
-            logger.warning(f"Failed to connect to MCP server {config.get('name')}: {e}")
-    return mcp_connections, all_mcp_tools
+    """Connect to all MCP servers using an AsyncExitStack via MCPManager. Returns (connections_map, all_mcp_tools)."""
+    manager = MCPManager()
+    return await manager.connect_servers(stack, mcp_server_configs)
 
 
 # ---------------------------------------------------------------------------
@@ -2781,6 +2800,8 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
             "llm": llm,
             "tool_hitl_map": _tool_hitl_map,
             "sandbox_container_id_override": sandbox_container_id_override,
+            "sandbox_container_id": sandbox_container_id_override,
+            "mcp_connections": mcp_connections if "mcp_connections" in locals() else {},
         }
 
         try:
@@ -2815,7 +2836,7 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
                     running = False
                     break
                 except Exception as e:
-                    yield {"event": "error", "data": json.dumps({"error": str(e)})}
+                    yield EventMapper.error(str(e))
                     return
 
                 u_details = getattr(update, "usage_details", None)
@@ -2832,7 +2853,7 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
                         if delta:
                             prev_len = len(full_content)
                             full_content += delta
-                            yield {"event": "content_delta", "data": json.dumps({"content": delta})}
+                            yield EventMapper.text_delta(delta)
                             for ev in _scan_content_for_elements(full_content, prev_len, edit_target=edit_target):
                                 yield ev
                             prev_len = len(full_content)
@@ -2840,7 +2861,7 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
                         reasoning_delta = c.text or ""
                         if reasoning_delta:
                             reasoning_parts.append(reasoning_delta)
-                            yield {"event": "reasoning_delta", "data": json.dumps({"content": reasoning_delta})}
+                            yield EventMapper.reasoning_delta(reasoning_delta)
                     elif ctype == "function_call":
                         tc_id = getattr(c, "call_id", None) or getattr(c, "id", None) or ""
                         tc_raw_name = getattr(c, "name", None)
@@ -2849,31 +2870,14 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
                         tc_name = tc_raw_name or tool_name_map.get(tc_id) or "tool_call"
                         tc_args = getattr(c, "arguments", {})
                         _tc.record_tool_span(tc_name, json.dumps(tc_args) if isinstance(tc_args, dict) else str(tc_args), "", 0, status="running")
-                        yield {
-                            "event": "tool_call",
-                            "data": json.dumps({
-                                "id": tc_id,
-                                "name": tc_name,
-                                "arguments": tc_args,
-                                "status": "running",
-                            })
-                        }
+                        yield EventMapper.tool_call(tc_id, tc_name, tc_args, status="running")
                     elif ctype == "function_result":
                         tc_id = getattr(c, "call_id", None) or getattr(c, "id", None) or ""
                         tc_raw_name = getattr(c, "name", None)
                         tc_name = tc_raw_name or tool_name_map.get(tc_id) or "tool_call"
                         result_val = getattr(c, "result", "")
                         _tc.record_tool_span(tc_name, "", str(result_val), 0, status="completed")
-                        yield {
-                            "event": "tool_call",
-                            "data": json.dumps({
-                                "id": tc_id,
-                                "name": tc_name,
-                                "arguments": getattr(c, "arguments", {}),
-                                "result": str(result_val),
-                                "status": "completed",
-                            })
-                        }
+                        yield EventMapper.tool_call(tc_id, tc_name, getattr(c, "arguments", {}), result=result_val, status="completed")
                         for ev in _yield_tool_element_events(tc_name, str(result_val)):
                             yield ev
                     elif ctype == "usage" or hasattr(c, "usage_details"):
@@ -2947,20 +2951,14 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
             "metadata": metadata,
             "created_at": assistant_msg.created_at.isoformat() if assistant_msg.created_at else None,
         }
-        yield {
-            "event": "message_complete",
-            "data": json.dumps(msg_response),
-        }
-        yield {
-            "event": "token_usage",
-            "data": json.dumps({
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "session_total_input": session_obj.total_input_tokens if session_obj else input_tokens,
-                "session_total_output": session_obj.total_output_tokens if session_obj else output_tokens,
-            }),
-        }
-        yield {"event": "done", "data": "{}"}
+        yield EventMapper.message_complete(msg_response)
+        yield EventMapper.token_usage(
+            input_tokens,
+            output_tokens,
+            session_obj.total_input_tokens if session_obj else input_tokens,
+            session_obj.total_output_tokens if session_obj else output_tokens,
+        )
+        yield EventMapper.done()
 
     except asyncio.CancelledError:
         logger.info("Cancelled MAF chat stream due to disconnect or cancellation.")
@@ -2978,10 +2976,7 @@ async def _stream_response(llm, messages, system_prompt, db, session_id, agent_i
             db.add(assistant_msg)
             db.commit()
 
-        yield {
-            "event": "error",
-            "data": json.dumps({"error": str(e)}),
-        }
+        yield EventMapper.error(str(e))
 
 
 async def _stream_response_with_mcp(llm, messages, system_prompt, db, session_id, agent_id, provider_record, start_time, native_tools, mcp_server_configs, kb_meta=None, agent=None, edit_target=None, past_messages=None, sandbox_container_id_override=None, response_schema=None):
@@ -3523,8 +3518,9 @@ async def _chat_with_tools_and_mcp(llm, messages: list, system_prompt: str | Non
                 tool_calls=[LLMToolCall(id=tc.id, name=tc.name, arguments=tc.arguments) for tc in response.tool_calls],
             ))
             for tc in response.tool_calls:
-                result = await _execute_mcp_or_native_tool(tc.name, tc.arguments, mcp_connections, db)
-                chat_messages.append(LLMMessage(role="tool", content=result, tool_call_id=tc.id))
+                runtime = ToolRuntimeContext(db=db, mcp_connections=mcp_connections or {})
+                res = await tool_executor.execute(tool_name=tc.name, arguments=tc.arguments, runtime=runtime)
+                chat_messages.append(LLMMessage(role="tool", content=res.output, tool_call_id=tc.id))
         final = await llm.chat(chat_messages, system_prompt=system_prompt)
         return final.content or ""
 
@@ -3545,8 +3541,9 @@ async def _chat_with_tools_and_mcp_mongo(llm, messages: list, system_prompt: str
                 tool_calls=[LLMToolCall(id=tc.id, name=tc.name, arguments=tc.arguments) for tc in response.tool_calls],
             ))
             for tc in response.tool_calls:
-                result = await _execute_mcp_or_native_tool_mongo(tc.name, tc.arguments, mcp_connections, mongo_db)
-                chat_messages.append(LLMMessage(role="tool", content=result, tool_call_id=tc.id))
+                runtime = ToolRuntimeContext(mongo_db=mongo_db, mcp_connections=mcp_connections or {})
+                res = await tool_executor.execute(tool_name=tc.name, arguments=tc.arguments, runtime=runtime)
+                chat_messages.append(LLMMessage(role="tool", content=res.output, tool_call_id=tc.id))
         final = await llm.chat(chat_messages, system_prompt=system_prompt)
         return final.content or ""
 

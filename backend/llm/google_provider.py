@@ -5,7 +5,11 @@ import httpx
 from typing import AsyncIterator
 
 from .base import BaseLLMProvider, LLMMessage, LLMStreamChunk, LLMToolCall
-from .schema_utils import format_schema_dict_for_gemini
+from .schema_utils import (
+    format_schema_dict_for_gemini,
+    normalize_tool_schema_for_gemini,
+    normalize_output_schema_for_gemini,
+)
 
 
 class GoogleProvider(BaseLLMProvider):
@@ -102,7 +106,7 @@ class GoogleProvider(BaseLLMProvider):
                 }
                 params = fn.get("parameters")
                 if params:
-                    decl["parameters"] = params
+                    decl["parameters"] = normalize_tool_schema_for_gemini(params)
                 declarations.append(decl)
         return [{"function_declarations": declarations}] if declarations else []
 
@@ -120,7 +124,7 @@ class GoogleProvider(BaseLLMProvider):
             generation_config["maxOutputTokens"] = self.config["max_tokens"]
         if response_schema:
             generation_config["responseMimeType"] = "application/json"
-            generation_config["responseJsonSchema"] = format_schema_dict_for_gemini(response_schema)
+            generation_config["responseJsonSchema"] = normalize_output_schema_for_gemini(response_schema)
         if generation_config:
             payload["generationConfig"] = generation_config
 
@@ -140,14 +144,17 @@ class GoogleProvider(BaseLLMProvider):
                 # Extract function calls
                 func_calls = [p for p in parts if "functionCall" in p]
                 if func_calls:
-                    parsed_tool_calls = [
-                        LLMToolCall(
-                            id=f"call_{i}",
-                            name=fc["functionCall"]["name"],
-                            arguments=json.dumps(fc["functionCall"].get("args", {})),
+                    parsed_tool_calls = []
+                    for i, fc in enumerate(func_calls):
+                        fc_obj = fc["functionCall"]
+                        call_id = fc_obj.get("id") or fc.get("id") or f"call_{fc_obj['name']}_{i}"
+                        parsed_tool_calls.append(
+                            LLMToolCall(
+                                id=call_id,
+                                name=fc_obj["name"],
+                                arguments=json.dumps(fc_obj.get("args", {})),
+                            )
                         )
-                        for i, fc in enumerate(func_calls)
-                    ]
                     return LLMMessage(role="assistant", content=text, tool_calls=parsed_tool_calls)
                 return LLMMessage(role="assistant", content=text)
             return LLMMessage(role="assistant", content="")
@@ -166,7 +173,7 @@ class GoogleProvider(BaseLLMProvider):
             generation_config["maxOutputTokens"] = self.config["max_tokens"]
         if response_schema:
             generation_config["responseMimeType"] = "application/json"
-            generation_config["responseJsonSchema"] = response_schema
+            generation_config["responseJsonSchema"] = normalize_output_schema_for_gemini(response_schema)
         if generation_config:
             payload["generationConfig"] = generation_config
 
@@ -175,6 +182,7 @@ class GoogleProvider(BaseLLMProvider):
 
         url = f"{self.base_url}/models/{self.model_id}:streamGenerateContent?alt=sse&key={self.api_key}"
 
+        tc_idx = 0
         async with httpx.AsyncClient(timeout=120.0) as client:
             async with client.stream("POST", url, json=payload) as response:
                 response.raise_for_status()
@@ -195,10 +203,12 @@ class GoogleProvider(BaseLLMProvider):
                                 yield LLMStreamChunk(type="content", content=part["text"])
                             elif "functionCall" in part:
                                 fc = part["functionCall"]
+                                tc_idx += 1
+                                call_id = fc.get("id") or part.get("id") or f"call_{fc['name']}_{tc_idx}"
                                 yield LLMStreamChunk(
                                     type="tool_call",
                                     tool_call=LLMToolCall(
-                                        id=f"call_{fc['name']}",
+                                        id=call_id,
                                         name=fc["name"],
                                         arguments=json.dumps(fc.get("args", {})),
                                     ),
