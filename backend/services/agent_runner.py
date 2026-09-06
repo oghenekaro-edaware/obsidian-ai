@@ -375,25 +375,16 @@ async def _run_headless_sqlite(
 
                 logger.info("agent_runner: HITL required for tool '%s' in session %s", tc.name, session_id)
 
+                from routers.chat_router import _wait_for_approval_or_db_poll
                 try:
-                    await asyncio.wait_for(hitl_event.wait(), timeout=600.0)
-                except asyncio.TimeoutError:
-                    approval.status = "denied"
-                    db.commit()
-                    _hitl_events.pop(event_key, None)
-                    messages.append(LLMMessage(
-                        role="user",
-                        content=f"[Tool '{tc.name}' approval timed out.]\n\n{TOOL_RESULT_PROMPT}",
-                    ))
-                    continue
+                    status = await _wait_for_approval_or_db_poll(hitl_event, str(approval.id), db=db)
                 finally:
                     _hitl_events.pop(event_key, None)
 
-                db.refresh(approval)
-                if approval.status == "denied":
+                if status == "denied":
                     messages.append(LLMMessage(
                         role="user",
-                        content=f"[Tool '{tc.name}' was denied by the user.]\n\n{TOOL_RESULT_PROMPT}",
+                        content=f"[Tool '{tc.name}' was denied by the user or timed out.]\n\n{TOOL_RESULT_PROMPT}",
                     ))
                     continue
 
@@ -644,24 +635,16 @@ async def _run_headless_mongo(
 
                 logger.info("agent_runner: HITL required for tool '%s' in session %s", tc.name, session_id)
 
+                from routers.chat_router import _wait_for_approval_or_db_poll
                 try:
-                    await asyncio.wait_for(hitl_event.wait(), timeout=600.0)
-                except asyncio.TimeoutError:
-                    await HITLApprovalCollection.update_status(mongo_db, approval_id, "denied")
-                    _hitl_events.pop(event_key, None)
-                    messages.append(LLMMessage(
-                        role="user",
-                        content=f"[Tool '{tc.name}' approval timed out.]\n\n{TOOL_RESULT_PROMPT}",
-                    ))
-                    continue
+                    status = await _wait_for_approval_or_db_poll(hitl_event, approval_id, mongo_db=mongo_db)
                 finally:
                     _hitl_events.pop(event_key, None)
 
-                updated = await HITLApprovalCollection.find_by_id(mongo_db, approval_id)
-                if not updated or updated.get("status") == "denied":
+                if status == "denied":
                     messages.append(LLMMessage(
                         role="user",
-                        content=f"[Tool '{tc.name}' was denied.]\n\n{TOOL_RESULT_PROMPT}",
+                        content=f"[Tool '{tc.name}' was denied or timed out.]\n\n{TOOL_RESULT_PROMPT}",
                     ))
                     continue
 
