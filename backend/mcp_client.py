@@ -92,6 +92,44 @@ class MCPConnection:
             return f"MCP server stdio process crashed during tool invocation: {e}"
 
 
+class MCPManager:
+    """Manages active connections and tool execution for MCP servers."""
+
+    def __init__(self):
+        self.connections: dict[str, MCPConnection] = {}
+
+    async def connect_servers(self, stack: Any, server_configs: list[dict]) -> tuple[dict[str, MCPConnection], list[dict]]:
+        """Connect to MCP servers using the provided exit stack. Returns (connections_map, all_tools)."""
+        self.connections.clear()
+        all_tools: list[dict] = []
+        for config in server_configs:
+            try:
+                conn = await stack.enter_async_context(connect_mcp_server(config))
+                self.connections[conn.server_name] = conn
+                all_tools.extend(conn.tools)
+            except Exception as e:
+                logger.warning(f"Failed to connect to MCP server {config.get('name')}: {e}")
+        return self.connections, all_tools
+
+    def list_tools(self) -> list[dict]:
+        """Return legacy tool dicts for all connected MCP servers."""
+        tools = []
+        for conn in self.connections.values():
+            tools.extend(conn.tools)
+        return tools
+
+    async def execute(self, tool_name: str, arguments: dict) -> str:
+        """Execute a tool by prefixed name ('mcp__<server>__<tool>')."""
+        parsed = parse_mcp_tool_name(tool_name)
+        if not parsed:
+            return json.dumps({"error": f"Invalid MCP tool name: {tool_name}"})
+        server_name, orig_tool_name = parsed
+        conn = self.connections.get(server_name)
+        if not conn:
+            return json.dumps({"error": f"MCP server '{server_name}' not connected"})
+        return await conn.call_tool(orig_tool_name, arguments)
+
+
 def parse_mcp_tool_name(prefixed_name: str) -> tuple[str, str] | None:
     """Parse 'mcp__<server_name>__<tool_name>' into (server_name, tool_name).
     Returns None if the name doesn't match the MCP prefix pattern."""

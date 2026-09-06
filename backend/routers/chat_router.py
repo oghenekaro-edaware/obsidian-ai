@@ -17,7 +17,7 @@ from auth import get_current_user, TokenData
 from encryption import decrypt_api_key
 from llm.base import LLMMessage, LLMToolCall, to_maf_messages
 from llm.provider_factory import create_provider_from_config
-from mcp_client import connect_mcp_server, parse_mcp_tool_name, MCPConnection
+from mcp_client import connect_mcp_server, parse_mcp_tool_name, MCPConnection, MCPManager
 from file_storage import FileStorageService
 from rag_service import RAGService
 from sandbox_tools import SANDBOX_TOOL_SCHEMAS, execute_sandbox_tool, is_sandbox_tool
@@ -1651,17 +1651,9 @@ async def _execute_mcp_or_native_tool_mongo(
 
 
 async def _connect_mcp_servers(stack: AsyncExitStack, mcp_server_configs: list[dict]) -> tuple[dict[str, MCPConnection], list[dict]]:
-    """Connect to all MCP servers using an AsyncExitStack. Returns (connections_map, all_mcp_tools)."""
-    mcp_connections: dict[str, MCPConnection] = {}
-    all_mcp_tools: list[dict] = []
-    for config in mcp_server_configs:
-        try:
-            conn = await stack.enter_async_context(connect_mcp_server(config))
-            mcp_connections[conn.server_name] = conn
-            all_mcp_tools.extend(conn.tools)
-        except Exception as e:
-            logger.warning(f"Failed to connect to MCP server {config.get('name')}: {e}")
-    return mcp_connections, all_mcp_tools
+    """Connect to all MCP servers using an AsyncExitStack via MCPManager. Returns (connections_map, all_mcp_tools)."""
+    manager = MCPManager()
+    return await manager.connect_servers(stack, mcp_server_configs)
 
 
 # ---------------------------------------------------------------------------
