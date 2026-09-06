@@ -327,10 +327,20 @@ async def _run_optimization_sqlite(
         # ── Stage 2: trace collection ──────────────────────────────────────────
         _update(run_id, status="analyzing")
 
+        try:
+            aid = int(agent_id)
+        except (ValueError, TypeError):
+            aid = agent_id
+
+        try:
+            uid = int(user_id)
+        except (ValueError, TypeError):
+            uid = user_id
+
         sessions = db.query(ChatSession).filter(
             ChatSession.entity_type == "agent",
-            ChatSession.entity_id == agent_id,
-            ChatSession.user_id == user_id,
+            ChatSession.entity_id == aid,
+            ChatSession.user_id == uid,
         ).order_by(ChatSession.created_at.desc()).limit(max_traces).all()
 
         # Fetch eval run results if a suite is selected
@@ -578,8 +588,20 @@ async def _run_optimization_mongo(
 
         # Sessions store agent reference via entity_type/entity_id
         _session_coll = mongo_db[SessionCollection.collection_name]
+        eid_clause = [str(agent_id)]
+        if str(agent_id).isdigit():
+            eid_clause.append(int(agent_id))
+
+        uid_clause = [str(user_id)]
+        if str(user_id).isdigit():
+            uid_clause.append(int(user_id))
+
         _cursor = _session_coll.find(
-            {"entity_type": "agent", "entity_id": agent_id, "user_id": user_id}
+            {
+                "entity_type": "agent",
+                "entity_id": {"$in": eid_clause},
+                "user_id": {"$in": uid_clause},
+            }
         ).sort("updated_at", -1).limit(max_traces)
         all_sessions = await _cursor.to_list(length=max_traces)
 
