@@ -477,3 +477,100 @@ def test_agent_invocation_executes_configured_tools_mcps_and_trace_spans(setup_d
             assert len(tool_spans) >= 1
     finally:
         db.close()
+
+
+def test_agent_invocation_uses_published_version_snapshot_tools(setup_data):
+    import json
+    from unittest.mock import patch, MagicMock
+    from models import ToolDefinition, LLMProvider, Agent, AgentAPIConfig
+
+    db = next(get_db())
+    try:
+        user = setup_data["user"]
+
+        provider = LLMProvider(
+            user_id=user.id,
+            name="Mock Provider 2",
+            provider_type="openai",
+            model_id="gpt-4o",
+            api_key="enc_key",
+        )
+        db.add(provider)
+        db.flush()
+
+        agent = db.get(Agent, setup_data["agent"].id)
+        agent.provider_id = provider.id
+
+        published_tool = ToolDefinition(
+            user_id=user.id,
+            name="published_tool_fn",
+            description="Tool available in published snapshot",
+            handler_type="python",
+            handler_config=json.dumps({"code": "def handler(x):\n    return f'Result {x}'"}),
+            parameters_json=json.dumps({
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+            }),
+            is_active=True,
+        )
+        db.add(published_tool)
+        db.flush()
+        tool_id = published_tool.id
+
+        agent.tools_json = json.dumps([tool_id])
+        db.commit()
+
+        # Verify tool_id in db
+        tool_in_db = db.query(ToolDefinition).filter(ToolDefinition.id == tool_id).first()
+        assert tool_in_db is not None
+
+        # Publish agent
+        token = setup_data["user_token"]
+        pub_res = client.post(
+            f"/api/v1/agents/{agent.id}/publish",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert pub_res.status_code == 200
+
+        # Now edit the draft agent directly in DB to clear its tools
+        agent = db.get(Agent, setup_data["agent"].id)
+        agent.tools_json = None
+        db.commit()
+
+        received_tools = []
+        async def mock_chat_stream(messages, system_prompt=None, tools=None, response_schema=None):
+            nonlocal received_tools
+            received_tools = ["WAS_CALLED"] + [t["function"]["name"] for t in (tools or [])]
+            class ContentChunk:
+                type = "content"
+                content = json.dumps({"answer": "snapshot tool verified"})
+                tool_call = None
+            class DoneChunk:
+                type = "done"
+                usage = {"input_tokens": 5, "output_tokens": 5}
+                finish_reason = "stop"
+                tool_call = None
+            yield ContentChunk()
+            yield DoneChunk()
+
+        mock_llm = MagicMock()
+        mock_llm.chat_stream.side_effect = mock_chat_stream
+
+        with patch("llm.provider_factory.create_provider_from_config", return_value=mock_llm), \
+             patch("encryption.decrypt_api_key", return_value="fake_key"), \
+             patch("rag_service.VectorStoreContextProvider.before_run"), \
+             patch("routers.memory_router.MemoryContextProvider.before_run"):
+
+            payload = {"input": {"query": "test published tool"}}
+            res = client.post(
+                f"/api/v1/agent-invocations/{agent.id}",
+                headers={"Authorization": f"Bearer {setup_data['api_key']}"},
+                json=payload,
+            )
+
+            assert res.status_code == 200
+            data = res.json()
+            assert data["status"] == "completed"
+            assert "published_tool_fn" in received_tools
+    finally:
+        db.close()

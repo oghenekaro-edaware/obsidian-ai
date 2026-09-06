@@ -1517,10 +1517,11 @@ def _build_tools_for_llm(agent, db) -> list[dict] | None:
             tool_ids = []
 
         if tool_ids:
+            int_tool_ids = [int(tid) for tid in tool_ids if str(tid).isdigit()]
             tool_defs = db.query(ToolDefinition).filter(
-                ToolDefinition.id.in_(tool_ids),
+                ToolDefinition.id.in_(int_tool_ids),
                 ToolDefinition.is_active == True,
-            ).all()
+            ).all() if int_tool_ids else []
 
             seen_names: set[str] = set()
             for td in tool_defs:
@@ -1554,10 +1555,11 @@ def _load_mcp_server_configs(agent, db) -> list[dict]:
     if not server_ids:
         return []
 
+    int_server_ids = [int(sid) for sid in server_ids if str(sid).isdigit()]
     servers = db.query(MCPServer).filter(
-        MCPServer.id.in_(server_ids),
+        MCPServer.id.in_(int_server_ids),
         MCPServer.is_active == True,
-    ).all()
+    ).all() if int_server_ids else []
 
     configs = []
     for s in servers:

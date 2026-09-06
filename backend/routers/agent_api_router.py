@@ -174,15 +174,17 @@ def publish_agent(agent_id: int, db: Session = Depends(get_db), user: TokenData 
     if not config.input_schema_version_id or not config.output_schema_version_id: raise HTTPException(422, "Published API agents require input and output schemas")
     owned_schema_version(db, config.input_schema_version_id, user.user_id, "input")
     owned_schema_version(db, config.output_schema_version_id, user.user_id, "output")
-    latest = db.query(AgentVersion).filter(AgentVersion.agent_id == agent_id).order_by(AgentVersion.version_number.desc()).first()
-    if not latest:
-        from routers.agents_router import _snapshot_agent_sqlite
-        latest = _snapshot_agent_sqlite(db, agent, "Published API version")
+    from routers.agents_router import _snapshot_agent_sqlite
+    new_snapshot = _snapshot_agent_sqlite(db, agent, "Published API version")
+    db.flush()
+    latest = new_snapshot or db.query(AgentVersion).filter(AgentVersion.agent_id == agent_id).order_by(AgentVersion.version_number.desc()).first()
     # Pin contract versions onto the immutable agent-version record; later schema
     # edits create new schema versions and cannot silently alter this deployment.
     latest.input_schema_version_id = config.input_schema_version_id
     latest.output_schema_version_id = config.output_schema_version_id
-    config.publication_state = "published"; config.published_version_id = latest.id; db.commit()
+    config.publication_state = "published"
+    config.published_version_id = latest.id
+    db.commit()
     return {"agent_id": str(agent_id), "agent_version": latest.version_number, "publication_state": "published"}
 
 @router.post("/agents/{agent_id}/{action}")
@@ -216,7 +218,7 @@ async def invoke_agent(agent_id: int, body: ExternalInvokeRequest, db: Session =
             db.add(APIRequest(request_id=request_id, application_id=int(key.application_id), api_key_id=int(key.api_key_id), agent_id=agent_id, agent_version_id=config.published_version_id, status="failed", error_code="OUTPUT_SCHEMA_VALIDATION_FAILED", duration_ms=int((time.monotonic()-started)*1000))); db.commit()
             raise HTTPException(status_code=502, detail={"error": {"code": "OUTPUT_SCHEMA_VALIDATION_FAILED", "message": "Supplied output failed schema validation", "request_id": request_id, "details": errors}})
         db.add(APIRequest(request_id=request_id, application_id=int(key.application_id), api_key_id=int(key.api_key_id), agent_id=agent_id, agent_version_id=config.published_version_id, status="completed", duration_ms=int((time.monotonic()-started)*1000))); db.commit()
-        version = db.get(AgentVersion, config.published_version_id)
+        version = db.get(AgentVersion, config.published_version_id) if config.published_version_id else None
         return {"request_id": request_id, "agent_id": str(agent_id), "agent_version": version.version_number if version else None, "input_schema_version": input_schema.version_number, "output_schema_version": output_schema.version_number, "status": "completed", "output": output}
 
     # Output validation & single bounded repair attempt
@@ -279,6 +281,7 @@ async def invoke_agent(agent_id: int, body: ExternalInvokeRequest, db: Session =
 
     output = None
     raw = ""
+    target_version_id = config.published_version_id if config.publication_state == "published" else None
 
     try:
         raw = await run_agent_headless(
@@ -288,6 +291,7 @@ async def invoke_agent(agent_id: int, body: ExternalInvokeRequest, db: Session =
             response_schema=output_schema_dict,
             system_instruction=session_system_instruction,
             knowledge_base_ids=session_knowledge_base_ids,
+            agent_version_id=target_version_id,
         )
         output = json.loads(raw or "")
         errors = validate_json_schema(output_schema_dict, output)
@@ -308,6 +312,7 @@ async def invoke_agent(agent_id: int, body: ExternalInvokeRequest, db: Session =
                 response_schema=output_schema_dict,
                 system_instruction=session_system_instruction,
                 knowledge_base_ids=session_knowledge_base_ids,
+                agent_version_id=target_version_id,
             )
             output = json.loads(raw_repair or "")
             errors = validate_json_schema(output_schema_dict, output)
