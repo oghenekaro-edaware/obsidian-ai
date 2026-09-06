@@ -1222,6 +1222,114 @@ def _scan_content_for_elements(full_content: str, prev_len: int, edit_target: tu
     return events
 
 
+def _validate_ssrf_url(url: str) -> str | None:
+    """
+    Validate a URL to protect against SSRF vulnerabilities.
+    Resolves hostnames to IP addresses and checks if they belong to private/loopback/link-local ranges.
+    Returns None if safe, or an error string if prohibited.
+    """
+    import os
+    if os.getenv("ALLOW_PRIVATE_NETWORKS", "").lower() in ("true", "1", "yes"):
+        return None
+
+    import socket
+    import ipaddress
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https"):
+        return f"Prohibited URL scheme: {parsed.scheme}. Only http and https are allowed."
+
+    hostname = parsed.hostname
+    if not hostname:
+        return "Invalid URL: missing hostname"
+
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+
+    try:
+        addr_info = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        return f"DNS resolution failed for hostname '{hostname}': {e}"
+    except Exception as e:
+        return f"Failed to resolve hostname '{hostname}': {e}"
+
+    if not addr_info:
+        return f"DNS resolution returned no addresses for hostname '{hostname}'"
+
+    for family, socktype, proto, canonname, sockaddr in addr_info:
+        ip_str = sockaddr[0]
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return f"Invalid IP address resolved: {ip_str}"
+
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_unspecified
+            or ip_obj.is_reserved
+        ):
+            return f"Access to private/internal network IP ({ip_str}) is blocked for security reasons."
+
+    return None
+
+
+def _execute_http_request_sync(method: str, url: str, headers: dict, params: dict | None, body: Any) -> str:
+    """Execute a synchronous HTTP request with SSRF validation and comprehensive error handling."""
+    ssrf_err = _validate_ssrf_url(url)
+    if ssrf_err:
+        return json.dumps({"error": f"SSRF blocked: {ssrf_err}"})
+
+    import httpx
+    try:
+        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            if method == "GET":
+                resp = client.get(url, params=params, headers=headers)
+            else:
+                if isinstance(body, (dict, list)):
+                    resp = client.request(method, url, json=body, headers=headers)
+                elif body is not None:
+                    resp = client.request(method, url, content=str(body), headers=headers)
+                else:
+                    resp = client.request(method, url, headers=headers)
+            return resp.text
+    except httpx.ConnectError as e:
+        return json.dumps({"error": f"HTTP connection failed: {e}"})
+    except httpx.RequestError as e:
+        return json.dumps({"error": f"HTTP request failed: {e}"})
+    except Exception as e:
+        return json.dumps({"error": f"HTTP request failed: {e}"})
+
+
+async def _execute_http_request_async(method: str, url: str, headers: dict, params: dict | None, body: Any) -> str:
+    """Execute an asynchronous HTTP request with SSRF validation and comprehensive error handling."""
+    ssrf_err = _validate_ssrf_url(url)
+    if ssrf_err:
+        return json.dumps({"error": f"SSRF blocked: {ssrf_err}"})
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            if method == "GET":
+                resp = await client.get(url, params=params, headers=headers)
+            else:
+                if isinstance(body, (dict, list)):
+                    resp = await client.request(method, url, json=body, headers=headers)
+                elif body is not None:
+                    resp = await client.request(method, url, content=str(body), headers=headers)
+                else:
+                    resp = await client.request(method, url, headers=headers)
+            return resp.text
+    except httpx.ConnectError as e:
+        return json.dumps({"error": f"HTTP connection failed: {e}"})
+    except httpx.RequestError as e:
+        return json.dumps({"error": f"HTTP request failed: {e}"})
+    except Exception as e:
+        return json.dumps({"error": f"HTTP request failed: {e}"})
+
+
 def _resolve_http_tool_request_params(config: dict, arguments: dict, tool_name: str = "") -> tuple[str, str, dict, dict | None, Any]:
     """
     Resolve URL, method, headers, params, and body for an HTTP tool call.
@@ -1308,25 +1416,11 @@ def _execute_tool(tool_name: str, arguments_str: str, db) -> str:
         return _execute_python_tool(code_str, arguments)
 
     elif handler_type == "http":
-        import httpx
         config = json.loads(tool_def.handler_config) if tool_def.handler_config else {}
         url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, tool_name)
         if not url:
             return json.dumps({"error": "No URL configured for this tool"})
-        try:
-            with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-                if method == "GET":
-                    resp = client.get(url, params=params, headers=headers)
-                else:
-                    if isinstance(body, (dict, list)):
-                        resp = client.request(method, url, json=body, headers=headers)
-                    elif body is not None:
-                        resp = client.request(method, url, content=str(body), headers=headers)
-                    else:
-                        resp = client.request(method, url, headers=headers)
-                return resp.text
-        except Exception as e:
-            return json.dumps({"error": f"HTTP request failed: {e}"})
+        return _execute_http_request_sync(method, url, headers, params, body)
 
     return json.dumps({"error": f"Unsupported handler type: {tool_def.handler_type}"})
 
@@ -1363,24 +1457,10 @@ async def _execute_tool_mongo(tool_name: str, arguments_str: str, mongo_db) -> s
         return _execute_python_tool(code_str, arguments)
 
     elif handler_type == "http":
-        import httpx
         url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, tool_name)
         if not url:
             return json.dumps({"error": "No URL configured for this tool"})
-        try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                if method == "GET":
-                    resp = await client.get(url, params=params, headers=headers)
-                else:
-                    if isinstance(body, (dict, list)):
-                        resp = await client.request(method, url, json=body, headers=headers)
-                    elif body is not None:
-                        resp = await client.request(method, url, content=str(body), headers=headers)
-                    else:
-                        resp = await client.request(method, url, headers=headers)
-                return resp.text
-        except Exception as e:
-            return json.dumps({"error": f"HTTP request failed: {e}"})
+        return await _execute_http_request_async(method, url, headers, params, body)
 
     return json.dumps({"error": f"Unsupported handler type: {handler_type}"})
 
