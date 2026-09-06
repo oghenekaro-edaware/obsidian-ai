@@ -1,16 +1,15 @@
 """Tests for Gemini JSON Schema adaptation and formatting."""
 
 import json
-from google.genai import types, _common
-from google.genai.models import _GenerateContentParameters_to_mldev
-from google.genai._api_client import BaseApiClient
-
+import pytest
+from llm.google_provider import GoogleProvider
 from llm.schema_utils import (
     _strip_unsupported_gemini_keys,
     format_schema_dict_for_gemini,
     format_schema_for_gemini,
+    normalize_tool_schema_for_gemini,
+    normalize_output_schema_for_gemini,
 )
-from llm.provider_factory import create_provider_from_config
 
 
 def test_strip_unsupported_gemini_keys():
@@ -46,100 +45,41 @@ def test_strip_unsupported_gemini_keys():
     assert "additional_properties" not in cleaned["properties"]["field_b"]
 
 
-def test_format_schema_for_gemini_conversion():
-    schema_dict = {
+def test_normalize_schema_helpers():
+    schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
-        "properties": {
-            "name": {"type": "string"},
-            "age": {"type": "integer"},
-            "meta": {
-                "type": "object",
-                "properties": {
-                    "tags": {
-                        "type": "array",
-                        "items": {"type": "string", "additionalProperties": False},
-                    }
+        "properties": {"foo": {"type": "string", "additionalProperties": False}},
+        "additionalProperties": False,
+    }
+    normalized_out = normalize_output_schema_for_gemini(schema)
+    assert "$schema" not in normalized_out
+    assert "additionalProperties" not in normalized_out
+
+    normalized_tool = normalize_tool_schema_for_gemini(schema)
+    assert "$schema" not in normalized_tool
+    assert "additionalProperties" not in normalized_tool
+
+
+def test_google_provider_convert_tools():
+    provider = GoogleProvider(api_key="test_key")
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "web search",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "additionalProperties": False,
                 },
-                "additional_properties": False,
             },
-        },
-        "required": ["name"],
-        "additionalProperties": False,
-    }
-
-    formatted = format_schema_for_gemini(schema_dict)
-    assert formatted is not None
-
-    # Simulate google.genai request payload construction
-    if not isinstance(formatted, dict):
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=formatted,
-        )
-    else:
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=formatted,
-        )
-
-    param = types._GenerateContentParameters(
-        model="gemini-2.5-flash",
-        contents="hello",
-        config=config,
-    )
-    converted = _GenerateContentParameters_to_mldev(
-        BaseApiClient(api_key="test"), param, None, param
-    )
-    dict_payload = _common.convert_to_dict(converted)
-    gen_config = dict_payload.get("generationConfig", {})
-
-    assert gen_config.get("responseMimeType") == "application/json"
-    res_schema = gen_config.get("responseSchema", {})
-
-    # Ensure no additional_properties / additionalProperties in final REST payload dict
-    payload_str = json.dumps(res_schema)
-    assert "additional_properties" not in payload_str
-    assert "additionalProperties" not in payload_str
-    assert "$schema" not in payload_str
-
-
-def test_provider_factory_gemini_schema_propagation():
-    agent = create_provider_from_config(
-        provider_type="gemini",
-        api_key="test_key",
-        base_url=None,
-        model_id="gemini-2.5-flash",
-    )
-
-    schema = {
-        "type": "object",
-        "properties": {
-            "result": {"type": "string", "additional_properties": False}
-        },
-        "additionalProperties": False,
-    }
-
-    formatted = format_schema_for_gemini(schema)
-    opts = {}
-    if isinstance(formatted, dict):
-        opts["response_format"] = formatted
-    else:
-        opts["response_schema"] = formatted
-
-    prepared_config = agent.client._prepare_config(opts, None)
-    assert prepared_config.response_schema is not None
-
-    param = types._GenerateContentParameters(
-        model="gemini-2.5-flash",
-        contents="hello",
-        config=prepared_config,
-    )
-    converted = _GenerateContentParameters_to_mldev(
-        BaseApiClient(api_key="test"), param, None, param
-    )
-    dict_payload = _common.convert_to_dict(converted)
-
-    payload_str = json.dumps(dict_payload)
-    assert "additional_properties" not in payload_str
-    assert "additionalProperties" not in payload_str
+        }
+    ]
+    converted = provider._convert_tools(tools)
+    assert len(converted) == 1
+    assert "function_declarations" in converted[0]
+    decl = converted[0]["function_declarations"][0]
+    assert decl["name"] == "search"
+    assert "additionalProperties" not in decl["parameters"]

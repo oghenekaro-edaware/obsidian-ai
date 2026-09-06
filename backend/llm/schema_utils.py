@@ -33,6 +33,20 @@ def format_schema_dict_for_gemini(schema: Any) -> dict | Any:
     return _strip_unsupported_gemini_keys(schema)
 
 
+def normalize_tool_schema_for_gemini(schema: Any) -> Any:
+    """Normalize tool parameter schemas for Gemini REST API."""
+    if not isinstance(schema, dict):
+        return schema
+    return _strip_unsupported_gemini_keys(schema)
+
+
+def normalize_output_schema_for_gemini(schema: Any) -> Any:
+    """Normalize output responseJsonSchema for Gemini REST API."""
+    if not isinstance(schema, dict):
+        return schema
+    return _strip_unsupported_gemini_keys(schema)
+
+
 def format_schema_for_gemini(schema: Any) -> Any:
     """Adapt a JSON schema dict into a Gemini-compatible Schema object or clean dict.
 
