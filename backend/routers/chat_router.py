@@ -4241,7 +4241,11 @@ async def _stream_response_mongo(llm, messages, system_prompt, mongo_db, session
 
             yield {"event": "tool_round", "data": json.dumps({"round": _round + 1, "max_rounds": MAX_TOOL_ROUNDS})}
 
-            messages.append(LLMMessage(role="assistant", content=""))
+            messages.append(LLMMessage(
+                role="assistant",
+                content=full_content or "",
+                tool_calls=[LLMToolCall(id=tc.id, name=tc.name, arguments=tc.arguments) for tc in tool_calls_collected],
+            ))
 
             for tc in tool_calls_collected:
                 # --- Tool proposal: intercept create_tool virtual calls ---
@@ -4462,8 +4466,9 @@ async def _stream_response_mongo(llm, messages, system_prompt, mongo_db, session
                     yield ev
 
                 messages.append(LLMMessage(
-                    role="user",
-                    content=f"[Tool '{tc.name}' returned: {result}]\n\n{TOOL_RESULT_PROMPT}",
+                    role="tool",
+                    content=result,
+                    tool_call_id=tc.id,
                 ))
 
             full_content = ""
@@ -4658,8 +4663,11 @@ async def _stream_response_with_mcp_mongo(llm, messages, system_prompt, mongo_db
                 # Notify frontend about the tool round
                 yield {"event": "tool_round", "data": json.dumps({"round": _round + 1, "max_rounds": MAX_TOOL_ROUNDS})}
 
-                # Add empty assistant message then user messages with tool results
-                messages.append(LLMMessage(role="assistant", content=""))
+                messages.append(LLMMessage(
+                    role="assistant",
+                    content=full_content or "",
+                    tool_calls=[LLMToolCall(id=tc.id, name=tc.name, arguments=tc.arguments) for tc in tool_calls_collected],
+                ))
 
                 for tc in tool_calls_collected:
                     # --- Tool proposal: intercept create_tool virtual calls ---
@@ -4869,10 +4877,10 @@ async def _stream_response_with_mcp_mongo(llm, messages, system_prompt, mongo_db
 
                     yield {"event": "tool_call", "data": json.dumps({"id": tc.id, "name": tc.name, "arguments": tc.arguments, "result": result, "status": "completed"})}
 
-                    # Feed result back as user message (compatible with all providers)
                     messages.append(LLMMessage(
-                        role="user",
-                        content=f"[Tool '{tc.name}' returned: {result}]\n\n{TOOL_RESULT_PROMPT}",
+                        role="tool",
+                        content=result,
+                        tool_call_id=tc.id,
                     ))
 
                 full_content = ""
