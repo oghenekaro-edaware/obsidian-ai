@@ -315,3 +315,140 @@ def test_external_invoke_supports_session_context():
 
     assert request.system_instruction == "Answer in bullets."
     assert request.knowledge_base_ids == ["1", "2", "3"]
+
+
+def test_agent_invocation_with_tools_mcps_and_traces(setup_data):
+    import json
+    from unittest.mock import patch, AsyncMock, MagicMock
+    from models import ToolDefinition, MCPServer, LLMProvider, TraceSpan
+    from encryption import encrypt_api_key
+    from llm.base import LLMStreamChunk, LLMToolCall
+
+    db = next(get_db())
+    try:
+        # Create LLM provider
+        provider = LLMProvider(
+            user_id=setup_data["user"].id,
+            name="Test LLM Provider",
+            provider_type="openai",
+            model_id="gpt-4o",
+            api_key=encrypt_api_key("test_key")
+        )
+        db.add(provider)
+        db.flush()
+
+        # Create custom native ToolDefinition
+        tool_def = ToolDefinition(
+            user_id=setup_data["user"].id,
+            name="calculator",
+            description="Add numbers",
+            parameters_json=json.dumps({"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}),
+            handler_type="http",
+            handler_config=json.dumps({"url": "http://example.com/api", "method": "POST"}),
+            is_active=True
+        )
+        db.add(tool_def)
+        db.flush()
+
+        # Create MCPServer
+        mcp_server = MCPServer(
+            user_id=setup_data["user"].id,
+            name="weather",
+            transport_type="stdio",
+            command="node",
+            args_json=json.dumps(["weather.js"]),
+            is_active=True
+        )
+        db.add(mcp_server)
+        db.flush()
+
+        # Configure agent with provider, tool, and mcp_server
+        agent = db.query(Agent).filter(Agent.id == setup_data["agent"].id).first()
+        agent.provider_id = provider.id
+        agent.model_id = "gpt-4o"
+        agent.tools_json = json.dumps([tool_def.id])
+        agent.mcp_servers_json = json.dumps([mcp_server.id])
+        db.commit()
+
+        agent_id = agent.id
+        key = setup_data["api_key"]
+    finally:
+        db.close()
+
+    # Mock LLM provider chat_stream
+    mock_llm = MagicMock()
+
+    async def mock_chat_stream(messages, system_prompt=None, tools=None, response_schema=None):
+        # Round 0: LLM decides to call tools
+        if len(messages) <= 1:
+            yield LLMStreamChunk(
+                type="tool_call",
+                tool_call=LLMToolCall(id="tc1", name="calculator", arguments={"a": 5, "b": 10})
+            )
+            yield LLMStreamChunk(
+                type="tool_call",
+                tool_call=LLMToolCall(id="tc2", name="mcp__weather__get_forecast", arguments={"city": "Paris"})
+            )
+            yield LLMStreamChunk(type="done", usage={"input_tokens": 100, "output_tokens": 50}, finish_reason="tool_calls")
+        else:
+            # Round 1: Final answer
+            yield LLMStreamChunk(type="content", content=json.dumps({"answer": "15 and sunny in Paris"}))
+            yield LLMStreamChunk(type="done", usage={"input_tokens": 150, "output_tokens": 30}, finish_reason="stop")
+
+    mock_llm.chat_stream = mock_chat_stream
+
+    mock_mcp_conn = AsyncMock()
+    mock_mcp_conn.call_tool.return_value = json.dumps({"forecast": "sunny"})
+
+    mcp_tools = [{
+        "type": "function",
+        "function": {
+            "name": "mcp__weather__get_forecast",
+            "description": "Get weather forecast",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+        }
+    }]
+
+    async def mock_connect_mcp_servers(stack, configs):
+        return {"weather": mock_mcp_conn}, mcp_tools
+
+    with patch("llm.provider_factory.create_provider_from_config", return_value=mock_llm), \
+         patch("routers.chat_router._connect_mcp_servers", side_effect=mock_connect_mcp_servers):
+
+        payload = {"input": {"query": "what is 5+10 and weather in Paris?"}}
+        res = client.post(
+            f"/api/v1/agent-invocations/{agent_id}",
+            headers={"Authorization": f"Bearer {key}"},
+            json=payload
+        )
+
+        assert res.status_code == 200, res.text
+        data = res.json()
+        assert data["status"] == "completed"
+        assert data["output"] == {"answer": "15 and sunny in Paris"}
+        session_id = data["session_id"]
+
+        # Verify trace spans recorded in DB
+        db = next(get_db())
+        try:
+            spans = db.query(TraceSpan).filter(TraceSpan.session_id == int(session_id)).order_by(TraceSpan.sequence.asc()).all()
+            span_types = [s.span_type for s in spans]
+            span_names = [s.name for s in spans]
+
+            assert "llm_call" in span_types
+            assert "tool_call" in span_types
+            assert "mcp_call" in span_types
+            assert "calculator" in span_names
+            assert "mcp__weather__get_forecast" in span_names
+        finally:
+            db.close()
+
+        # Query trace API endpoint
+        trace_res = client.get(
+            f"/traces/sessions/{session_id}",
+            headers={"Authorization": f"Bearer {setup_data['user_token']}"}
+        )
+        assert trace_res.status_code == 200
+        trace_data = trace_res.json()
+        assert trace_data["span_count"] >= 3
+        assert trace_data["total_input_tokens"] > 0
