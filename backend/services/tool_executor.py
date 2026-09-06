@@ -114,8 +114,10 @@ class ToolExecutor:
         # 4. Native / DB tools
         try:
             from routers.chat_router import _execute_tool, _execute_tool_mongo
-            if ctx.mongo_db:
-                out = await _execute_tool_mongo(tool_name, tc_arguments_str, ctx.mongo_db)
+            from config import DATABASE_TYPE
+            mongo_handle = ctx.mongo_db or (ctx.db if DATABASE_TYPE == "mongo" else None)
+            if mongo_handle:
+                out = await _execute_tool_mongo(tool_name, tc_arguments_str, mongo_handle)
             else:
                 out = _execute_tool(tool_name, tc_arguments_str, ctx.db)
             return ToolExecutionResult(output=out)
