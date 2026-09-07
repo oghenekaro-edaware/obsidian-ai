@@ -34,7 +34,9 @@ import {
   Code,
   Sparkles,
   ShieldAlert,
+  Bot,
 } from "lucide-react"
+import type { Agent } from "@/types/playground"
 
 interface ToolDialogProps {
   open: boolean
@@ -267,6 +269,35 @@ const TEMPLATES: ToolTemplate[] = [
       2,
     ),
   },
+  {
+    id: "agent_tool",
+    name: "delegate_task",
+    label: "Agent as Tool",
+    description: "Delegate tasks to another predefined agent and return its response",
+    icon: Bot,
+    handlerType: "python",
+    parameters: JSON.stringify(
+      {
+        type: "object",
+        properties: {
+          prompt: {
+            type: "string",
+            description: "The task or prompt to delegate to the target agent",
+          },
+        },
+        required: ["prompt"],
+      },
+      null,
+      2,
+    ),
+    handlerConfig: JSON.stringify(
+      {
+        code: "def handler(params):\n    agent_id = ''\n    prompt = params.get('prompt', '')\n    return invoke_agent(agent_id, prompt)",
+      },
+      null,
+      2,
+    ),
+  },
 ]
 
 export function ToolDialog({ open, onOpenChange, initialTool }: ToolDialogProps) {
@@ -285,6 +316,16 @@ export function ToolDialog({ open, onOpenChange, initialTool }: ToolDialogProps)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
 
+  const [agents, setAgents] = useState<Agent[]>([])
+  const [selectedAgentId, setSelectedAgentId] = useState<string>("")
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>("")
+
+  useEffect(() => {
+    if (open) {
+      apiClient.listAgents().then(setAgents).catch((err) => console.error("Failed to load agents:", err))
+    }
+  }, [open])
+
   // Sync form state when initialTool changes (e.g. opening edit for a different tool)
   useEffect(() => {
     if (initialTool) {
@@ -302,14 +343,35 @@ export function ToolDialog({ open, onOpenChange, initialTool }: ToolDialogProps)
   }, [initialTool])
 
   const handlePickTemplate = (template: ToolTemplate) => {
+    setSelectedTemplateId(template.id)
     setName(template.name)
     setDescription(template.description)
     setHandlerType(template.handlerType)
     setParametersJson(template.parameters)
     setHandlerConfigJson(template.handlerConfig)
     setRequiresConfirmation(false)
+    setSelectedAgentId("")
     setError("")
     setView("form")
+  }
+
+  const handleSelectTargetAgent = (agentId: string) => {
+    setSelectedAgentId(agentId)
+    const targetAgent = agents.find((a) => a.id === agentId)
+    if (!targetAgent) return
+
+    const sanitizedAgentName = targetAgent.name.toLowerCase().replace(/[^a-z0-9_]/g, "_")
+    setName(`ask_${sanitizedAgentName}`)
+    setDescription(targetAgent.description || `Delegates tasks to the ${targetAgent.name} agent.`)
+    setHandlerConfigJson(
+      JSON.stringify(
+        {
+          code: `def handler(params):\n    agent_id = "${agentId}"\n    prompt = params.get('prompt', '')\n    return invoke_agent(agent_id, prompt)`,
+        },
+        null,
+        2,
+      ),
+    )
   }
 
   const handleStartBlank = () => {
@@ -527,6 +589,31 @@ export function ToolDialog({ open, onOpenChange, initialTool }: ToolDialogProps)
             </DialogHeader>
 
             <div className="grid gap-4 py-2 max-h-[60vh] overflow-y-auto pr-1">
+              {/* Target Agent Selector for Agent as Tool */}
+              {(selectedTemplateId === "agent_tool" || handlerConfigJson.includes("invoke_agent")) && (
+                <div className="grid gap-1.5 p-3 bg-muted/40 rounded-lg border border-border">
+                  <Label htmlFor="target-agent" className="flex items-center gap-1.5 text-xs font-semibold">
+                    <Bot className="h-3.5 w-3.5 text-primary" />
+                    Target Agent
+                  </Label>
+                  <Select value={selectedAgentId} onValueChange={handleSelectTargetAgent}>
+                    <SelectTrigger id="target-agent">
+                      <SelectValue placeholder="Select an agent to delegate to..." />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {agents.map((ag) => (
+                        <SelectItem key={ag.id} value={ag.id}>
+                          {ag.name} {ag.description ? `— ${ag.description}` : ""}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-[11px] text-muted-foreground mt-0.5">
+                    Selecting an agent will auto-populate the tool name, description, and Python handler code.
+                  </p>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 gap-4">
                 <div className="grid gap-1.5">
                   <Label htmlFor="tool-name">Name</Label>
