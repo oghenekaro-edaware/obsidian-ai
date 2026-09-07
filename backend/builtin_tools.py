@@ -292,12 +292,402 @@ async def fetch_url(url: str, max_chars: int = 8000) -> str:
     return json.dumps({"url": url, "content": combined})
 
 
+def _get_context_db(runtime):
+    db = getattr(runtime, "db", None) if runtime else None
+    mongo_db = getattr(runtime, "mongo_db", None) if runtime else None
+    if not db and not mongo_db:
+        from config import DATABASE_TYPE
+        if DATABASE_TYPE == "mongo":
+            from database_mongo import get_database
+            mongo_db = get_database()
+        else:
+            from database import SessionLocal
+            db = SessionLocal()
+    return db, mongo_db
+
+
+@ai_function
+async def create_dynamic_tool(
+    name: str,
+    description: str,
+    handler_type: str,
+    parameters: dict = None,
+    handler_config: dict = None,
+    **kwargs,
+) -> str:
+    """Create or update a custom tool definition (Python code or HTTP endpoint) that can be used by AI agents and workflows."""
+    runtime = kwargs.get("runtime")
+    db, mongo_db = _get_context_db(runtime)
+
+    params_json = json.dumps(parameters) if isinstance(parameters, dict) else (parameters or "{}")
+    config_json = json.dumps(handler_config) if isinstance(handler_config, dict) else (handler_config or "{}")
+
+    if mongo_db is not None:
+        from models_mongo import ToolDefinitionCollection
+        user_id = str(runtime.agent.get("user_id")) if runtime and hasattr(runtime, "agent") and isinstance(runtime.agent, dict) and runtime.agent.get("user_id") else "1"
+        existing = await mongo_db[ToolDefinitionCollection.collection_name].find_one({"name": name, "user_id": user_id, "is_active": True})
+        if existing:
+            await ToolDefinitionCollection.update(mongo_db, str(existing["_id"]), user_id, {
+                "description": description,
+                "handler_type": handler_type,
+                "parameters_json": params_json,
+                "handler_config": config_json,
+                "is_model_created": True,
+            })
+            tool_id = str(existing["_id"])
+        else:
+            created = await ToolDefinitionCollection.create(mongo_db, {
+                "user_id": user_id,
+                "name": name,
+                "description": description,
+                "handler_type": handler_type,
+                "parameters_json": params_json,
+                "handler_config": config_json,
+                "is_model_created": True,
+            })
+            tool_id = str(created["_id"])
+        return json.dumps({"status": "success", "tool_id": tool_id, "name": name, "message": f"Tool '{name}' created/updated successfully."})
+
+    from models import ToolDefinition, User
+    user_id = 1
+    if runtime and getattr(runtime, "agent", None):
+        user_id = getattr(runtime.agent, "user_id", 1) or 1
+    else:
+        first_user = db.query(User).first()
+        if first_user:
+            user_id = first_user.id
+
+    existing = db.query(ToolDefinition).filter(
+        ToolDefinition.name == name,
+        ToolDefinition.user_id == user_id,
+        ToolDefinition.is_active == True,
+    ).first()
+
+    if existing:
+        existing.description = description
+        existing.handler_type = handler_type
+        existing.parameters_json = params_json
+        existing.handler_config = config_json
+        existing.is_model_created = True
+        db.commit()
+        db.refresh(existing)
+        tool_id = str(existing.id)
+    else:
+        tool = ToolDefinition(
+            user_id=user_id,
+            name=name,
+            description=description,
+            handler_type=handler_type,
+            parameters_json=params_json,
+            handler_config=config_json,
+            is_active=True,
+            is_model_created=True,
+        )
+        db.add(tool)
+        db.commit()
+        db.refresh(tool)
+        tool_id = str(tool.id)
+
+    return json.dumps({"status": "success", "tool_id": tool_id, "name": name, "message": f"Tool '{name}' created/updated successfully."})
+
+
+@ai_function
+async def create_agent(
+    name: str,
+    description: str = "",
+    system_prompt: str = "",
+    model_id: str = "gpt-4o",
+    tool_names: list[str] = None,
+    role: str = None,
+    **kwargs,
+) -> str:
+    """Create a new AI agent with a specific role/description, system prompt, model, and assigned tools."""
+    runtime = kwargs.get("runtime")
+    db, mongo_db = _get_context_db(runtime)
+
+    agent_desc = description or role or ""
+
+    if mongo_db is not None:
+        from models_mongo import AgentCollection, ToolDefinitionCollection
+        user_id = str(runtime.agent.get("user_id")) if runtime and hasattr(runtime, "agent") and isinstance(runtime.agent, dict) and runtime.agent.get("user_id") else "1"
+        provider = await mongo_db["llm_providers"].find_one({"is_active": True}) or await mongo_db["llm_providers"].find_one({})
+        provider_id = str(provider["_id"]) if provider else None
+
+        tool_ids = []
+        if tool_names:
+            for tn in tool_names:
+                td = await mongo_db[ToolDefinitionCollection.collection_name].find_one({"name": tn, "is_active": True})
+                if td:
+                    tool_ids.append(str(td["_id"]))
+
+        created = await AgentCollection.create(mongo_db, {
+            "user_id": user_id,
+            "name": name,
+            "description": agent_desc,
+            "system_prompt": system_prompt,
+            "model_id": model_id or "gpt-4o",
+            "provider_id": provider_id,
+            "tools_json": json.dumps(tool_ids),
+        })
+        return json.dumps({"status": "success", "agent_id": str(created["_id"]), "name": name, "description": agent_desc, "message": f"Agent '{name}' created successfully."})
+
+    from models import Agent, LLMProvider, ToolDefinition, User
+    user_id = 1
+    if runtime and getattr(runtime, "agent", None):
+        user_id = getattr(runtime.agent, "user_id", 1) or 1
+    else:
+        first_user = db.query(User).first()
+        if first_user:
+            user_id = first_user.id
+
+    provider = db.query(LLMProvider).filter(LLMProvider.user_id == user_id).first() or db.query(LLMProvider).first()
+    provider_id = provider.id if provider else None
+
+    tool_ids = []
+    if tool_names:
+        tools_defs = db.query(ToolDefinition).filter(ToolDefinition.name.in_(tool_names), ToolDefinition.is_active == True).all()
+        tool_ids = [td.id for td in tools_defs]
+
+    agent = Agent(
+        user_id=user_id,
+        name=name,
+        description=agent_desc,
+        system_prompt=system_prompt,
+        model_id=model_id or "gpt-4o",
+        provider_id=provider_id,
+        tools_json=json.dumps(tool_ids),
+        is_active=True,
+    )
+    db.add(agent)
+    db.commit()
+    db.refresh(agent)
+
+    return json.dumps({"status": "success", "agent_id": str(agent.id), "name": name, "description": agent_desc, "message": f"Agent '{name}' created successfully."})
+
+
+@ai_function
+async def create_workflow(
+    name: str,
+    description: str = "",
+    steps: list[dict] = None,
+    **kwargs,
+) -> str:
+    """Create or spawn a dynamic workflow (linear or DAG graph with steps/nodes) connecting agents, tools, and tasks."""
+    runtime = kwargs.get("runtime")
+    db, mongo_db = _get_context_db(runtime)
+
+    steps = steps or []
+    if not steps:
+        return json.dumps({"error": "steps parameter cannot be empty"})
+
+    processed_steps = []
+    for idx, s in enumerate(steps):
+        s_copy = dict(s)
+        s_copy["order"] = s_copy.get("order", idx + 1)
+        s_copy["node_type"] = s_copy.get("node_type", "agent")
+        s_copy["task"] = s_copy.get("task", "")
+        s_copy["id"] = s_copy.get("id") or f"step_{s_copy['order']}"
+
+        agent_name = s_copy.get("agent_name")
+        if agent_name and not s_copy.get("agent_id"):
+            if mongo_db is not None:
+                ag = await mongo_db["agents"].find_one({"name": agent_name, "is_active": True})
+                if ag:
+                    s_copy["agent_id"] = str(ag["_id"])
+            elif db is not None:
+                from models import Agent
+                ag = db.query(Agent).filter(Agent.name == agent_name, Agent.is_active == True).first()
+                if ag:
+                    s_copy["agent_id"] = str(ag.id)
+        processed_steps.append(s_copy)
+
+    steps_str = json.dumps(processed_steps)
+
+    if mongo_db is not None:
+        from models_mongo import WorkflowCollection
+        user_id = str(runtime.agent.get("user_id")) if runtime and hasattr(runtime, "agent") and isinstance(runtime.agent, dict) and runtime.agent.get("user_id") else "1"
+        created = await WorkflowCollection.create(mongo_db, {
+            "user_id": user_id,
+            "name": name,
+            "description": description or "",
+            "steps_json": steps_str,
+        })
+        return json.dumps({"status": "success", "workflow_id": str(created["_id"]), "name": name, "steps_count": len(processed_steps), "message": f"Workflow '{name}' created successfully."})
+
+    from models import Workflow, User
+    user_id = 1
+    if runtime and getattr(runtime, "agent", None):
+        user_id = getattr(runtime.agent, "user_id", 1) or 1
+    else:
+        first_user = db.query(User).first()
+        if first_user:
+            user_id = first_user.id
+
+    workflow = Workflow(
+        user_id=user_id,
+        name=name,
+        description=description or "",
+        steps_json=steps_str,
+        is_active=True,
+    )
+    db.add(workflow)
+    db.commit()
+    db.refresh(workflow)
+
+    return json.dumps({"status": "success", "workflow_id": str(workflow.id), "name": name, "steps_count": len(processed_steps), "message": f"Workflow '{name}' created successfully."})
+
+
+@ai_function
+async def execute_workflow(
+    workflow_id_or_name: str,
+    input_text: str,
+    **kwargs,
+) -> str:
+    """Execute an existing workflow by ID or name with input text, and return the final execution result."""
+    runtime = kwargs.get("runtime")
+    db, mongo_db = _get_context_db(runtime)
+
+    workflow_obj = None
+    if mongo_db is not None:
+        from models_mongo import WorkflowCollection
+        if len(workflow_id_or_name) == 24:
+            workflow_obj = await WorkflowCollection.find_by_id(mongo_db, workflow_id_or_name)
+        if not workflow_obj:
+            workflow_obj = await mongo_db[WorkflowCollection.collection_name].find_one({"name": workflow_id_or_name, "is_active": True})
+    else:
+        from models import Workflow
+        if workflow_id_or_name.isdigit():
+            workflow_obj = db.query(Workflow).filter(Workflow.id == int(workflow_id_or_name), Workflow.is_active == True).first()
+        if not workflow_obj:
+            workflow_obj = db.query(Workflow).filter(Workflow.name == workflow_id_or_name, Workflow.is_active == True).first()
+
+    if not workflow_obj:
+        return json.dumps({"error": f"Workflow '{workflow_id_or_name}' not found"})
+
+    wf_name = workflow_obj.get("name") if isinstance(workflow_obj, dict) else workflow_obj.name
+    wf_id = str(workflow_obj.get("_id") if isinstance(workflow_obj, dict) else workflow_obj.id)
+    steps_raw = workflow_obj.get("steps_json") if isinstance(workflow_obj, dict) else workflow_obj.steps_json
+    steps = json.loads(steps_raw) if isinstance(steps_raw, str) else (steps_raw or [])
+
+    if not steps:
+        return json.dumps({"error": f"Workflow '{wf_name}' has no steps"})
+
+    # Ensure every step has id and depends_on
+    for idx, s in enumerate(steps):
+        s.setdefault("id", f"node_{idx+1}")
+        if idx > 0 and not s.get("depends_on"):
+            s["depends_on"] = [steps[idx-1]["id"]]
+
+    from dag_executor import DagContext, execute_dag
+
+    if mongo_db is not None:
+        from models_mongo import AgentCollection, LLMProviderCollection
+        from routers.workflow_runs_router import _build_tools_mongo, _load_mcp_configs_mongo, _execute_tool_mongo, _evaluate_condition_mongo, _create_llm_mongo
+
+        async def _get_agent(agent_id: str):
+            return await AgentCollection.find_by_id(mongo_db, agent_id)
+
+        async def _get_provider(agent):
+            if not agent.get("provider_id"):
+                return None
+            return await LLMProviderCollection.find_by_id(mongo_db, str(agent["provider_id"]))
+
+        async def _build_tools_a(agent):
+            return await _build_tools_mongo(agent, mongo_db)
+
+        async def _load_mcp_a(agent):
+            return await _load_mcp_configs_mongo(agent, mongo_db)
+
+        async def _execute_native_tool(name, args):
+            return await _execute_tool_mongo(name, args, mongo_db)
+
+        async def _evaluate_condition_a(upstream, uinput, branches, prompt):
+            return await _evaluate_condition_mongo(upstream, uinput, branches, prompt, mongo_db)
+
+        async def _update(updates):
+            pass
+
+        ctx = DagContext(
+            get_agent=_get_agent,
+            get_provider=_get_provider,
+            create_llm=_create_llm_mongo,
+            build_tools=_build_tools_a,
+            load_mcp_configs=_load_mcp_a,
+            execute_native_tool=_execute_native_tool,
+            evaluate_condition=_evaluate_condition_a,
+            update_run=_update,
+        )
+    else:
+        from models import Agent, LLMProvider
+        from routers.workflow_runs_router import _build_tools, _load_mcp_configs, _execute_tool, _evaluate_condition, _create_llm
+
+        async def _get_agent(agent_id: str):
+            return db.query(Agent).filter(Agent.id == int(agent_id)).first()
+
+        async def _get_provider(agent):
+            if not agent.provider_id:
+                return None
+            return db.query(LLMProvider).filter(LLMProvider.id == agent.provider_id).first()
+
+        async def _build_tools_a(agent):
+            return _build_tools(agent, db)
+
+        async def _load_mcp_a(agent):
+            return _load_mcp_configs(agent, db)
+
+        async def _execute_native_tool(name, args):
+            return _execute_tool(name, args, db)
+
+        async def _evaluate_condition_a(upstream, uinput, branches, prompt):
+            return await _evaluate_condition(upstream, uinput, branches, prompt, db)
+
+        async def _update(updates):
+            pass
+
+        ctx = DagContext(
+            get_agent=_get_agent,
+            get_provider=_get_provider,
+            create_llm=_create_llm,
+            build_tools=_build_tools_a,
+            load_mcp_configs=_load_mcp_a,
+            execute_native_tool=_execute_native_tool,
+            evaluate_condition=_evaluate_condition_a,
+            update_run=_update,
+        )
+
+    step_results = []
+    final_output = ""
+    try:
+        async for ev in execute_dag(steps, wf_name, input_text, ctx):
+            if ev["event"] == "workflow_done":
+                step_results = ev.get("step_results", [])
+                outputs = ev.get("outputs", {})
+                sink_ids = [s["id"] for s in steps if not any(s["id"] in (st.get("depends_on") or []) for st in steps)]
+                final_output = "\n\n".join(outputs.get(nid, "") for nid in sink_ids if outputs.get(nid))
+                if not final_output and outputs:
+                    final_output = "\n\n".join(v for v in outputs.values() if v)
+    except Exception as e:
+        return json.dumps({"error": f"Workflow execution failed: {e}"})
+
+    return json.dumps({
+        "status": "completed",
+        "workflow_id": wf_id,
+        "workflow_name": wf_name,
+        "final_output": final_output,
+        "steps": step_results,
+    })
+
+
 BUILTIN_TOOLS = {
     "web_search": web_search,
     "calculator": calculator,
     "weather": weather,
     "time": time,
     "fetch_url": fetch_url,
+    "create_dynamic_tool": create_dynamic_tool,
+    "create_agent": create_agent,
+    "create_workflow": create_workflow,
+    "execute_workflow": execute_workflow,
 }
 
 BUILTIN_TOOL_NAMES = set(BUILTIN_TOOLS.keys())
@@ -307,8 +697,8 @@ def is_builtin_tool(tool_name: str) -> bool:
     return tool_name in BUILTIN_TOOL_NAMES
 
 
-async def execute_builtin_tool(tool_name: str, arguments_str: str) -> str:
-    """Legacy dispatcher executing builtin FunctionTool by name."""
+async def execute_builtin_tool(tool_name: str, arguments_str: str, runtime=None) -> str:
+    """Legacy/unified dispatcher executing builtin FunctionTool by name."""
     try:
         args = json.loads(arguments_str) if arguments_str else {}
     except json.JSONDecodeError:
@@ -317,6 +707,9 @@ async def execute_builtin_tool(tool_name: str, arguments_str: str) -> str:
     tool_obj = BUILTIN_TOOLS.get(tool_name)
     if not tool_obj:
         return json.dumps({"error": f"Unknown builtin tool: {tool_name}"})
+
+    if tool_name in ("create_dynamic_tool", "create_agent", "create_workflow", "execute_workflow"):
+        return await tool_obj.func(**args, runtime=runtime)
 
     res = await tool_obj.invoke(arguments=args)
     if isinstance(res, list) and len(res) > 0 and hasattr(res[0], "text"):
