@@ -1418,11 +1418,105 @@ def _resolve_http_tool_request_params(config: dict, arguments: dict, tool_name: 
     return url, method, headers, params, body
 
 
-def _execute_python_tool(code_str: str, arguments: dict) -> str:
+def _make_invoke_agent_fn(db=None, mongo_db=None):
+    def invoke_agent(agent_id: str | int, prompt: Any) -> str:
+        from services.agent_runner import run_agent_headless
+        from config import DATABASE_TYPE
+        import asyncio
+        import concurrent.futures
+
+        prompt_str = prompt if isinstance(prompt, str) else json.dumps(prompt)
+
+        async def _run_async():
+            if DATABASE_TYPE == "mongo" or mongo_db:
+                from database_mongo import get_database
+                from models_mongo import SessionCollection, MessageCollection, AgentCollection
+                from bson.errors import InvalidId
+                mdb = mongo_db or get_database()
+                agent = None
+                try:
+                    agent = await AgentCollection.find_by_id(mdb, str(agent_id))
+                except (InvalidId, TypeError, ValueError):
+                    pass
+                if not agent:
+                    try:
+                        cursor = mdb["agents"].find({"name": str(agent_id), "is_active": True})
+                        agents = await cursor.to_list(length=1)
+                        if agents:
+                            agent = agents[0]
+                    except Exception:
+                        pass
+                if not agent:
+                    return json.dumps({"error": f"Target agent '{agent_id}' not found"})
+
+                sess = await SessionCollection.create(mdb, {
+                    "user_id": agent.get("user_id"),
+                    "title": "Agent Tool Invocation",
+                    "entity_type": "agent",
+                    "entity_id": str(agent["_id"]),
+                })
+                sess_id = str(sess["_id"])
+                await MessageCollection.create(mdb, {
+                    "session_id": sess_id,
+                    "role": "user",
+                    "content": prompt_str,
+                })
+                reply = await run_agent_headless(sess_id, str(agent["_id"]))
+                return reply or ""
+            else:
+                from database import SessionLocal
+                from models import Session as SessionModel, Message, Agent
+                s_db = SessionLocal()
+                try:
+                    agent = None
+                    if str(agent_id).isdigit():
+                        agent = s_db.query(Agent).filter(Agent.id == int(agent_id)).first()
+                    if not agent:
+                        agent = s_db.query(Agent).filter(Agent.name == str(agent_id)).first()
+                    if not agent:
+                        return json.dumps({"error": f"Target agent '{agent_id}' not found"})
+
+                    sess = SessionModel(
+                        user_id=agent.user_id,
+                        title="Agent Tool Invocation",
+                        entity_type="agent",
+                        entity_id=agent.id,
+                    )
+                    s_db.add(sess)
+                    s_db.commit()
+                    s_db.refresh(sess)
+
+                    user_msg = Message(session_id=sess.id, role="user", content=prompt_str)
+                    s_db.add(user_msg)
+                    s_db.commit()
+
+                    reply = await run_agent_headless(sess.id, agent.id, db=s_db)
+                    return reply or ""
+                finally:
+                    s_db.close()
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(lambda: asyncio.run(_run_async()))
+                return future.result(timeout=60)
+        else:
+            return asyncio.run(_run_async())
+
+    return invoke_agent
+
+
+def _execute_python_tool(code_str: str, arguments: dict, db=None, mongo_db=None) -> str:
     """Execute a Python tool handler and return the result as a string."""
     try:
+        invoke_fn = _make_invoke_agent_fn(db=db, mongo_db=mongo_db)
         local_ns: dict = {}
-        exec(code_str, {"__builtins__": __builtins__}, local_ns)
+        global_ns: dict = {"__builtins__": __builtins__, "invoke_agent": invoke_fn}
+        exec(code_str, global_ns, local_ns)
         handler_fn = local_ns.get("handler")
         if not handler_fn:
             return json.dumps({"error": "No 'handler' function found in tool code"})
@@ -1453,7 +1547,7 @@ def _execute_tool(tool_name: str, arguments_str: str, db) -> str:
         code_str = config.get("code") or ""
         if not code_str:
             return json.dumps({"error": "No code configured for this tool"})
-        return _execute_python_tool(code_str, arguments)
+        return _execute_python_tool(code_str, arguments, db=db)
 
     elif handler_type == "http":
         config = json.loads(tool_def.handler_config) if tool_def.handler_config else {}
@@ -1494,7 +1588,7 @@ async def _execute_tool_mongo(tool_name: str, arguments_str: str, mongo_db) -> s
         code_str = config.get("code") or ""
         if not code_str:
             return json.dumps({"error": "No code configured for this tool"})
-        return _execute_python_tool(code_str, arguments)
+        return _execute_python_tool(code_str, arguments, mongo_db=mongo_db)
 
     elif handler_type == "http":
         url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, tool_name)

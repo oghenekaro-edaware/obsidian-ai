@@ -19,7 +19,7 @@ from encryption import decrypt_api_key
 from llm.base import LLMMessage
 from llm.provider_factory import create_provider_from_config
 from mcp_client import connect_mcp_server, parse_mcp_tool_name, MCPConnection
-from routers.chat_router import _resolve_http_tool_request_params
+from routers.chat_router import _resolve_http_tool_request_params, _execute_python_tool
 
 if DATABASE_TYPE == "mongo":
     from database_mongo import get_database
@@ -69,19 +69,6 @@ def _create_llm_mongo(provider_record, agent_model_id: str | None = None):
     )
 
 
-def _execute_python_tool(code_str: str, arguments: dict) -> str:
-    try:
-        local_ns: dict = {}
-        exec(code_str, {"__builtins__": __builtins__}, local_ns)
-        handler_fn = local_ns.get("handler")
-        if not handler_fn:
-            return json.dumps({"error": "No 'handler' function found in tool code"})
-        result = handler_fn(arguments)
-        return json.dumps(result) if isinstance(result, (dict, list)) else str(result)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
 def _execute_tool(tool_name: str, arguments_str: str, db) -> str:
     try:
         arguments = json.loads(arguments_str) if arguments_str else {}
@@ -95,7 +82,7 @@ def _execute_tool(tool_name: str, arguments_str: str, db) -> str:
     handler_type = (tool_def.handler_type or "").lower()
     if handler_type == "python":
         config = json.loads(tool_def.handler_config) if tool_def.handler_config else {}
-        return _execute_python_tool(config.get("code") or "", arguments)
+        return _execute_python_tool(config.get("code") or "", arguments, db=db)
     elif handler_type == "http":
         from routers.chat_router import _execute_http_request_sync
         config = json.loads(tool_def.handler_config) if tool_def.handler_config else {}
@@ -127,7 +114,7 @@ async def _execute_tool_mongo(tool_name: str, arguments_str: str, mongo_db) -> s
     else:
         config = {}
     if handler_type == "python":
-        return _execute_python_tool(config.get("code") or "", arguments)
+        return _execute_python_tool(config.get("code") or "", arguments, mongo_db=mongo_db)
     elif handler_type == "http":
         from routers.chat_router import _execute_http_request_async
         url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, tool_name)

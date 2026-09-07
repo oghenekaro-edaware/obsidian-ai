@@ -10,7 +10,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from routers.chat_router import _resolve_http_tool_request_params
+from routers.chat_router import _resolve_http_tool_request_params, _execute_python_tool
 
 logger = logging.getLogger(__name__)
 
@@ -466,7 +466,7 @@ def _execute_tool_sqlite(tool_name: str, arguments_str: str, db) -> str:
     handler_type = (tool_def.handler_type or "").lower()
     if handler_type == "python":
         config = json.loads(tool_def.handler_config) if tool_def.handler_config else {}
-        return _exec_python_tool(config.get("code") or "", arguments)
+        return _execute_python_tool(config.get("code") or "", arguments, db=db)
     elif handler_type == "http":
         from routers.chat_router import _execute_http_request_sync
         config = json.loads(tool_def.handler_config) if tool_def.handler_config else {}
@@ -878,7 +878,7 @@ async def _execute_tool_mongo_native(tool_name: str, arguments_str: str, mongo_d
     config_raw = tool_def.get("handler_config")
     config = json.loads(config_raw) if isinstance(config_raw, str) and config_raw else (config_raw or {})
     if handler_type == "python":
-        return _exec_python_tool(config.get("code") or "", arguments)
+        return _execute_python_tool(config.get("code") or "", arguments, mongo_db=mongo_db)
     elif handler_type == "http":
         from routers.chat_router import _execute_http_request_async
         url, method, headers, params, body = _resolve_http_tool_request_params(config, arguments, tool_name)
