@@ -602,12 +602,19 @@ async def _run_workflow_sqlite(workflow_id, data, current_user, db):
     # Resolve agent names for step results
     step_results = []
     for s in sorted_steps:
-        agent = db.query(Agent).filter(Agent.id == int(s["agent_id"])).first()
+        node_type = s.get("node_type", "agent")
+        if node_type == "agent" and s.get("agent_id"):
+            agent = db.query(Agent).filter(Agent.id == int(s["agent_id"])).first()
+            agent_name = agent.name if agent else "Unknown"
+        else:
+            agent_name = node_type.capitalize()
         step_results.append({
+            "node_id": s.get("id"),
             "order": s["order"],
-            "agent_id": s["agent_id"],
-            "agent_name": agent.name if agent else "Unknown",
-            "task": s["task"],
+            "node_type": node_type,
+            "agent_id": s.get("agent_id"),
+            "agent_name": agent_name,
+            "task": s.get("task", ""),
             "status": "pending",
         })
 
@@ -663,8 +670,41 @@ async def _execute_workflow_sqlite(run, workflow, sorted_steps, step_results, us
 
         for i, step_def in enumerate(sorted_steps):
             step_order = step_def["order"]
-            agent_id = int(step_def["agent_id"])
-            task = step_def["task"]
+            node_type = step_def.get("node_type", "agent")
+            task = step_def.get("task", "")
+
+            if node_type == "start":
+                out = previous_output
+                step_results[i]["status"] = "completed"
+                step_results[i]["output"] = out
+                step_results[i]["started_at"] = datetime.now(timezone.utc).isoformat()
+                step_results[i]["completed_at"] = datetime.now(timezone.utc).isoformat()
+                _update_run(db, run_id, {"steps_json": json.dumps(step_results)})
+                yield {"event": "step_complete", "data": json.dumps({"step_order": step_order, "agent_name": "Start", "output": out})}
+                previous_output = out
+                continue
+
+            if node_type == "end":
+                out = previous_output
+                step_results[i]["status"] = "completed"
+                step_results[i]["output"] = out
+                step_results[i]["started_at"] = datetime.now(timezone.utc).isoformat()
+                step_results[i]["completed_at"] = datetime.now(timezone.utc).isoformat()
+                _update_run(db, run_id, {"steps_json": json.dumps(step_results)})
+                yield {"event": "step_complete", "data": json.dumps({"step_order": step_order, "agent_name": "End", "output": out})}
+                previous_output = out
+                continue
+
+            agent_id_raw = step_def.get("agent_id")
+            if not agent_id_raw:
+                step_results[i]["status"] = "failed"
+                step_results[i]["error"] = "No agent assigned"
+                _update_run(db, run_id, {"steps_json": json.dumps(step_results), "status": "failed", "error": f"No agent assigned for step {step_order}"})
+                yield {"event": "step_error", "data": json.dumps({"step_order": step_order, "error": "No agent assigned"})}
+                yield {"event": "workflow_error", "data": json.dumps({"run_id": str(run_id), "error": f"No agent assigned for step {step_order}"})}
+                return
+
+            agent_id = int(agent_id_raw)
 
             # Load agent + provider
             agent = db.query(Agent).filter(Agent.id == agent_id).first()
