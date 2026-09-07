@@ -51,6 +51,7 @@ async def run_agent_headless(
     response_schema: dict | None = None,
     system_instruction: str | None = None,
     knowledge_base_ids: list[str] | None = None,
+    agent_version_id: int | str | None = None,
 ) -> str | None:
     """
     Run the most recent unprocessed user message in a session through its agent
@@ -70,12 +71,14 @@ async def run_agent_headless(
             response_schema=response_schema,
             system_instruction=system_instruction,
             knowledge_base_ids=knowledge_base_ids,
+            agent_version_id=agent_version_id,
         )
     return await _run_headless_sqlite(
         int(session_id), int(agent_id), db,
         response_schema=response_schema,
         system_instruction=system_instruction,
         knowledge_base_ids=knowledge_base_ids,
+        agent_version_id=agent_version_id,
     )
 
 
@@ -191,8 +194,9 @@ async def _run_headless_sqlite(
     response_schema: dict | None = None,
     system_instruction: str | None = None,
     knowledge_base_ids: list[str] | None = None,
+    agent_version_id: int | str | None = None,
 ) -> str | None:
-    from models import Agent, LLMProvider, Message, AgentMemory, ToolDefinition, HITLApproval
+    from models import Agent, AgentVersion, LLMProvider, Message, AgentMemory, ToolDefinition, HITLApproval
     from llm.base import LLMMessage
     from llm.provider_factory import create_provider_from_config
     from encryption import decrypt_api_key
@@ -213,8 +217,39 @@ async def _run_headless_sqlite(
     )
 
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
-    if not agent or not agent.provider_id:
-        logger.warning("agent_runner: agent %s not found or has no provider", agent_id)
+    if not agent:
+        logger.warning("agent_runner: agent %s not found", agent_id)
+        return None
+
+    if agent_version_id is not None:
+        try:
+            ver_id_int = int(agent_version_id)
+            version_rec = db.get(AgentVersion, ver_id_int)
+            if version_rec and version_rec.config_snapshot:
+                db.expunge(agent)
+                snapshot = json.loads(version_rec.config_snapshot)
+                if isinstance(snapshot, dict):
+                    for key in (
+                        "tools_json",
+                        "mcp_servers_json",
+                        "knowledge_base_ids_json",
+                        "hitl_confirmation_tools_json",
+                        "system_prompt",
+                        "model_id",
+                        "provider_id",
+                        "allow_tool_creation",
+                        "config_json",
+                    ):
+                        if key in snapshot:
+                            val = snapshot[key]
+                            if key in ("tools_json", "mcp_servers_json", "knowledge_base_ids_json", "hitl_confirmation_tools_json") and isinstance(val, (list, dict)):
+                                val = json.dumps(val)
+                            setattr(agent, key, val)
+        except Exception as e:
+            logger.warning("Failed to apply agent_version_id %s snapshot: %s", agent_version_id, e)
+
+    if not agent.provider_id:
+        logger.warning("agent_runner: agent %s has no provider", agent_id)
         return None
 
     provider_record = db.query(LLMProvider).filter(LLMProvider.id == agent.provider_id).first()
@@ -453,6 +488,7 @@ async def _run_headless_mongo(
     response_schema: dict | None = None,
     system_instruction: str | None = None,
     knowledge_base_ids: list[str] | None = None,
+    agent_version_id: int | str | None = None,
 ) -> str | None:
     from database_mongo import get_database
     from models_mongo import AgentCollection, LLMProviderCollection, MessageCollection, AgentMemoryCollection, ToolDefinitionCollection, HITLApprovalCollection
@@ -481,6 +517,38 @@ async def _run_headless_mongo(
     if not agent:
         logger.warning("agent_runner mongo: agent %s not found", agent_id)
         return None
+
+    if agent_version_id is not None:
+        try:
+            from bson import ObjectId
+            from bson.errors import InvalidId
+            version_doc = None
+            try:
+                version_doc = await mongo_db["agent_versions"].find_one({"_id": ObjectId(str(agent_version_id))})
+            except (InvalidId, TypeError):
+                pass
+            if not version_doc:
+                version_doc = await mongo_db["agent_versions"].find_one({"_id": str(agent_version_id)})
+            if version_doc and version_doc.get("config_snapshot"):
+                snapshot = version_doc["config_snapshot"]
+                if isinstance(snapshot, str):
+                    try:
+                        snapshot = json.loads(snapshot)
+                    except Exception:
+                        snapshot = {}
+                if isinstance(snapshot, dict):
+                    for k in (
+                        "tools_json", "mcp_servers_json", "knowledge_base_ids_json",
+                        "hitl_confirmation_tools_json", "system_prompt", "model_id",
+                        "provider_id", "allow_tool_creation", "config_json"
+                    ):
+                        if k in snapshot:
+                            val = snapshot[k]
+                            if k in ("tools_json", "mcp_servers_json", "knowledge_base_ids_json", "hitl_confirmation_tools_json") and isinstance(val, (list, dict)):
+                                val = json.dumps(val)
+                            agent[k] = val
+        except Exception as e:
+            logger.warning("Failed to apply Mongo agent_version_id %s snapshot: %s", agent_version_id, e)
 
     provider_record = await resolve_provider_for_agent(mongo_db, agent)
     if not provider_record:
