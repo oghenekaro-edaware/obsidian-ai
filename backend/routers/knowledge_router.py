@@ -18,7 +18,7 @@ from schemas import (
     KBSearchRequest, KBSearchResponse, KBSearchResultItem,
 )
 from auth import (
-    get_current_user, get_current_user_or_api_client, TokenData, APIClientData, require_permission
+    get_current_user, get_current_user_or_api_client, TokenData, APIClientData, ApplicationKeyData, require_permission
 )
 from file_storage import FileStorageService
 from rate_limiter import limiter
@@ -35,13 +35,17 @@ router = APIRouter(tags=["knowledge-bases"])
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_auth_user_id(auth: Union[TokenData, APIClientData]) -> str:
+def _get_auth_user_id(auth: Union[TokenData, APIClientData, ApplicationKeyData]) -> str:
     if isinstance(auth, TokenData):
         return auth.user_id
     elif isinstance(auth, APIClientData):
         if auth.user_id:
             return auth.user_id
         return auth.client_id
+    elif isinstance(auth, ApplicationKeyData):
+        if auth.user_id:
+            return auth.user_id
+        return auth.application_id
     raise HTTPException(status_code=401, detail="Authentication failed")
 
 
@@ -128,7 +132,7 @@ async def upsert_app_knowledge_base(
     request: Request,
     data: KnowledgeBaseAppUpsertRequest,
     response: Response,
-    auth: Union[TokenData, APIClientData] = Depends(get_current_user_or_api_client),
+    auth: Union[TokenData, APIClientData, ApplicationKeyData] = Depends(get_current_user_or_api_client),
     db: Session = Depends(get_db),
 ):
     """
@@ -330,7 +334,7 @@ async def ingest_app_knowledge_document(
     request: Request,
     data: KnowledgeAppIngestRequest,
     response: Response,
-    auth: Union[TokenData, APIClientData] = Depends(get_current_user_or_api_client),
+    auth: Union[TokenData, APIClientData, ApplicationKeyData] = Depends(get_current_user_or_api_client),
     db: Session = Depends(get_db),
 ):
     """
@@ -503,7 +507,7 @@ async def ingest_app_knowledge_document(
 async def list_app_knowledge_bases(
     request: Request,
     app_id: str,
-    auth: Union[TokenData, APIClientData] = Depends(get_current_user_or_api_client),
+    auth: Union[TokenData, APIClientData, ApplicationKeyData] = Depends(get_current_user_or_api_client),
     db: Session = Depends(get_db),
 ):
     """
@@ -544,7 +548,7 @@ async def list_app_knowledge_bases(
 async def search_knowledge_base_content(
     kb_id: str,
     data: KBSearchRequest,
-    auth: Union[TokenData, APIClientData] = Depends(get_current_user_or_api_client),
+    auth: Union[TokenData, APIClientData, ApplicationKeyData] = Depends(get_current_user_or_api_client),
     db: Session = Depends(get_db),
 ):
     owner_id = _get_auth_user_id(auth)

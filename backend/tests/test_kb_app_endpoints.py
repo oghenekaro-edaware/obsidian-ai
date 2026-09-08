@@ -321,6 +321,78 @@ def test_kb_document_idempotency_via_document_external_id(setup_kb_data):
         db.close()
 
 
+def test_kb_application_api_key_auth(setup_kb_data):
+    import json
+    from models import Application, APIKey
+    from services.api_key_service import generate_api_key, hash_api_key
+
+    db = next(get_db())
+    try:
+        user = setup_kb_data["user"]
+        app_obj = Application(user_id=user.id, name="KB App", status="active")
+        db.add(app_obj)
+        db.flush()
+
+        prefix, secret, oba_key = generate_api_key()
+        key_record = APIKey(
+            application_id=app_obj.id,
+            name="KB Key",
+            key_prefix=prefix,
+            secret_hash=hash_api_key(secret),
+            scopes_json=json.dumps(["kb:read", "kb:write"])
+        )
+        db.add(key_record)
+        db.commit()
+    finally:
+        db.close()
+
+    # 1. Test upsert via Authorization: Bearer oba_...
+    upsert_res = client.put(
+        "/knowledge/apps/upsert",
+        headers={"Authorization": f"Bearer {oba_key}"},
+        json={
+            "app_id": "app-key-service",
+            "external_id": "service-kb-1",
+            "name": "Service KB",
+            "description": "Knowledge base created via Application API Key"
+        }
+    )
+    assert upsert_res.status_code in (200, 201)
+    kb_id = upsert_res.json()["kb_id"]
+
+    # 2. Test ingest via X-API-Key: oba_...
+    ingest_res = client.post(
+        "/knowledge/apps/ingest",
+        headers={"X-API-Key": oba_key},
+        json={
+            "app_id": "app-key-service",
+            "external_id": "service-kb-1",
+            "document_external_id": "doc-1",
+            "doc_type": "text",
+            "title": "Service Doc",
+            "content": "Service document content for testing"
+        }
+    )
+    assert ingest_res.status_code in (200, 201)
+
+    # 3. Test list_app_knowledge_bases via Bearer oba_...
+    list_res = client.get(
+        "/knowledge/apps/app-key-service",
+        headers={"Authorization": f"Bearer {oba_key}"}
+    )
+    assert list_res.status_code == 200
+    assert len(list_res.json()["knowledge_bases"]) == 1
+
+    # 4. Test search_knowledge_base_content via X-API-Key oba_...
+    search_res = client.post(
+        f"/knowledge-bases/{kb_id}/search",
+        headers={"X-API-Key": oba_key},
+        json={"query": "Service document content"}
+    )
+    assert search_res.status_code == 200
+    assert len(search_res.json()["results"]) > 0
+
+
 def test_get_knowledge_bases_by_app_id(setup_kb_data):
     token = setup_kb_data["jwt_token"]
     client.put(
