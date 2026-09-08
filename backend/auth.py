@@ -42,6 +42,13 @@ class APIClientData(BaseModel):
     token_type      : str = "api_client"
 
 
+class ApplicationKeyData(BaseModel):
+    application_id: str
+    api_key_id: str
+    user_id: Optional[str] = None
+    scopes: list[str]
+    token_type: str = "application_key"
+
 
 bearer_scheme       = HTTPBearer(auto_error=False)
 api_key_header      = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -187,14 +194,29 @@ async def get_current_user_or_api_client(
     api_key: Optional[str] = Depends(api_key_header),
     api_secret: Optional[str] = Depends(api_secret_header),
     db: Session = Depends(get_db),
-) -> TokenData | APIClientData:
+) -> TokenData | APIClientData | ApplicationKeyData:
     """
-    Dependency that accepts either JWT token (for logged-in users)
-    or API key/secret (for external clients).
+    Dependency that accepts either JWT token (for logged-in users),
+    Application API key (oba_...), or API credentials (X-API-Key, X-API-Secret).
     """
+    is_oba_bearer = credentials and credentials.credentials and credentials.credentials.strip().startswith("oba_")
+    is_oba_key = api_key and api_key.strip().startswith("oba_")
+
+    if is_oba_bearer or is_oba_key:
+        try:
+            return await get_application_api_key(credentials=credentials, api_key=api_key, db=db)
+        except HTTPException:
+            pass
+
     if credentials:
         try:
             return await get_current_user(credentials)
+        except HTTPException:
+            pass
+
+    if (credentials and credentials.credentials) or api_key:
+        try:
+            return await get_application_api_key(credentials=credentials, api_key=api_key, db=db)
         except HTTPException:
             pass
 
@@ -206,7 +228,7 @@ async def get_current_user_or_api_client(
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Authentication required. Provide either Bearer token or API credentials (X-API-Key, X-API-Secret)",
+        detail="Authentication required. Provide either Bearer token, Application API key, or API credentials (X-API-Key, X-API-Secret)",
     )
 
 
@@ -287,13 +309,6 @@ def require_permission(permission_key: str):
             )
     return _check
 
-class ApplicationKeyData(BaseModel):
-    application_id: str
-    api_key_id: str
-    scopes: list[str]
-    token_type: str = "application_key"
-
-
 async def get_application_api_key(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     api_key: Optional[str] = Depends(api_key_header),
@@ -315,17 +330,47 @@ async def get_application_api_key(
         raise HTTPException(status_code=401, detail="Application API key required")
     api_key = token
     prefix, secret = (part.strip() for part in token.split(".", 1))
-    from models import APIKey, Application
     from services.api_key_service import verify_api_key
-    key = db.query(APIKey).filter(APIKey.key_prefix == prefix).first()
     now = datetime.now(timezone.utc)
-    if not key or key.revoked_at or (key.expires_at and key.expires_at.replace(tzinfo=timezone.utc) <= now):
-        raise HTTPException(status_code=401, detail="Invalid, expired, or revoked API key")
-    if not verify_api_key(secret, key.secret_hash):
-        raise HTTPException(status_code=401, detail="Invalid, expired, or revoked API key")
-    app = db.query(Application).filter(Application.id == key.application_id, Application.status == "active").first()
-    if not app:
-        raise HTTPException(status_code=401, detail="Application is inactive")
-    key.last_used_at = now
-    db.commit()
-    return ApplicationKeyData(application_id=str(app.id), api_key_id=str(key.id), scopes=json.loads(key.scopes_json))
+
+    if DATABASE_TYPE == "mongo":
+        mongo_db = get_database()
+        from models_mongo import APIKeyCollection, ApplicationCollection
+        key = await APIKeyCollection.find_by_prefix(mongo_db, prefix)
+        if not key:
+            raise HTTPException(status_code=401, detail="Invalid, expired, or revoked API key")
+        revoked_at = key.get("revoked_at")
+        expires_at = key.get("expires_at")
+        if revoked_at or (expires_at and expires_at.replace(tzinfo=timezone.utc) <= now):
+            raise HTTPException(status_code=401, detail="Invalid, expired, or revoked API key")
+        if not verify_api_key(secret, key.get("secret_hash", "")):
+            raise HTTPException(status_code=401, detail="Invalid, expired, or revoked API key")
+        app = await ApplicationCollection.find_by_id(mongo_db, str(key.get("application_id")))
+        if not app or app.get("status") != "active":
+            raise HTTPException(status_code=401, detail="Application is inactive")
+        await APIKeyCollection.update(mongo_db, str(key["_id"]), {"last_used_at": now})
+        scopes = json.loads(key.get("scopes_json", "[]")) if isinstance(key.get("scopes_json"), str) else key.get("scopes_json", [])
+        return ApplicationKeyData(
+            application_id=str(app["_id"]),
+            api_key_id=str(key["_id"]),
+            user_id=str(app.get("user_id")),
+            scopes=scopes,
+        )
+    else:
+        from models import APIKey, Application
+        key = db.query(APIKey).filter(APIKey.key_prefix == prefix).first()
+        if not key or key.revoked_at or (key.expires_at and key.expires_at.replace(tzinfo=timezone.utc) <= now):
+            raise HTTPException(status_code=401, detail="Invalid, expired, or revoked API key")
+        if not verify_api_key(secret, key.secret_hash):
+            raise HTTPException(status_code=401, detail="Invalid, expired, or revoked API key")
+        app = db.query(Application).filter(Application.id == key.application_id, Application.status == "active").first()
+        if not app:
+            raise HTTPException(status_code=401, detail="Application is inactive")
+        key.last_used_at = now
+        db.commit()
+        return ApplicationKeyData(
+            application_id=str(app.id),
+            api_key_id=str(key.id),
+            user_id=str(app.user_id),
+            scopes=json.loads(key.scopes_json or "[]"),
+        )
