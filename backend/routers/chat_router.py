@@ -1978,26 +1978,43 @@ async def _build_user_llm_message(
             kb_name = _kb_names.get(kb_id, kb_id)
 
             kb_config = {}
-            if owner_id:
-                if DATABASE_TYPE == "mongo":
-                    from database_mongo import get_database
-                    from models_mongo import KnowledgeBaseCollection
-                    _kb_obj = await KnowledgeBaseCollection.find_by_id(get_database(), str(kb_id))
+            target_kb_id = str(kb_id)
+            if DATABASE_TYPE == "mongo":
+                from database_mongo import get_database
+                mongo_db = get_database()
+                from bson import ObjectId
+                from bson.errors import InvalidId
+                _kb_obj = None
+                try:
+                    _kb_obj = await mongo_db["knowledge_bases"].find_one({"_id": ObjectId(str(kb_id)), "is_active": True})
+                except (InvalidId, TypeError, ValueError):
+                    pass
+                if not _kb_obj:
+                    _kb_obj = await mongo_db["knowledge_bases"].find_one({"external_id": str(kb_id), "is_active": True})
+                if _kb_obj:
+                    target_kb_id = str(_kb_obj["_id"])
+                    kb_name = _kb_obj.get("name", kb_name)
+                    kb_config = {
+                        "secret_id": _kb_obj.get("secret_id"),
+                        "embedding_provider": _kb_obj.get("embedding_provider", "google"),
+                        "embedding_model": _kb_obj.get("embedding_model", "gemini-embedding-2"),
+                    }
+            else:
+                if db:
+                    from sqlalchemy import or_
+                    _kb_obj = None
+                    if str(kb_id).isdigit():
+                        _kb_obj = db.query(KnowledgeBase).filter(KnowledgeBase.id == int(kb_id), KnowledgeBase.is_active == True).first()
+                    if not _kb_obj:
+                        _kb_obj = db.query(KnowledgeBase).filter(KnowledgeBase.external_id == str(kb_id), KnowledgeBase.is_active == True).first()
                     if _kb_obj:
+                        target_kb_id = str(_kb_obj.id)
+                        kb_name = _kb_obj.name
                         kb_config = {
-                            "secret_id": _kb_obj.get("secret_id"),
-                            "embedding_provider": _kb_obj.get("embedding_provider", "google"),
-                            "embedding_model": _kb_obj.get("embedding_model", "gemini-embedding-2"),
+                            "secret_id": _kb_obj.secret_id,
+                            "embedding_provider": _kb_obj.embedding_provider or "google",
+                            "embedding_model": _kb_obj.embedding_model or "gemini-embedding-2",
                         }
-                else:
-                    if db:
-                        _kb_obj = db.query(KnowledgeBase).filter(KnowledgeBase.id == (int(kb_id) if str(kb_id).isdigit() else kb_id)).first()
-                        if _kb_obj:
-                            kb_config = {
-                                "secret_id": _kb_obj.secret_id,
-                                "embedding_provider": _kb_obj.embedding_provider or "google",
-                                "embedding_model": _kb_obj.embedding_model or "gemini-embedding-2",
-                            }
 
             from services.key_resolution_service import resolve_embedding_credentials
             e_prov, e_key, e_model = await resolve_embedding_credentials(
@@ -2005,7 +2022,7 @@ async def _build_user_llm_message(
             )
 
             results = await RAGService.query_kb_async(
-                kb_id, message_text, top_k=3,
+                target_kb_id, message_text, top_k=3,
                 embedding_provider=e_prov, api_key=e_key, model=e_model
             )
             if results:
@@ -2456,10 +2473,21 @@ async def _chat_sqlite(request: ChatRequest, current_user: TokenData, db: DBSess
         if _agent_for_kb and _agent_for_kb.knowledge_base_ids_json:
             _agent_kb_ids = json.loads(_agent_for_kb.knowledge_base_ids_json)
             if _agent_kb_ids:
+                from sqlalchemy import or_
+                digit_ids = [int(k) for k in _agent_kb_ids if str(k).isdigit()]
+                str_ids = [str(k) for k in _agent_kb_ids]
                 kb_records = db.query(KnowledgeBase).filter(
-                    KnowledgeBase.id.in_([int(k) for k in _agent_kb_ids]),
+                    KnowledgeBase.is_active == True,
+                    or_(
+                        KnowledgeBase.id.in_(digit_ids) if digit_ids else False,
+                        KnowledgeBase.external_id.in_(str_ids),
+                    ),
                 ).all()
-                _agent_kb_names = {str(kb.id): kb.name for kb in kb_records}
+                _agent_kb_names = {}
+                for kb in kb_records:
+                    _agent_kb_names[str(kb.id)] = kb.name
+                    if kb.external_id:
+                        _agent_kb_names[kb.external_id] = kb.name
 
     # Detect artifact edit intent early so it can be used in both message building and system prompt
     _edit_target_early = _extract_edit_target(request.message)
@@ -4141,10 +4169,20 @@ async def _chat_mongo(request: ChatRequest, current_user: TokenData, start_time:
                 _agent_kb_ids_mongo = kb_raw
             if _agent_kb_ids_mongo:
                 from models_mongo import KnowledgeBaseCollection as _KBColl
+                from bson import ObjectId
+                from bson.errors import InvalidId
                 for _kid in _agent_kb_ids_mongo:
-                    _kb_doc = await _KBColl.find_by_id(mongo_db, str(_kid))
+                    _kb_doc = None
+                    try:
+                        _kb_doc = await _KBColl.find_by_id(mongo_db, str(_kid))
+                    except (InvalidId, TypeError, ValueError):
+                        pass
+                    if not _kb_doc:
+                        _kb_doc = await mongo_db["knowledge_bases"].find_one({"external_id": str(_kid), "is_active": True})
                     if _kb_doc:
                         _agent_kb_names_mongo[str(_kid)] = _kb_doc.get("name", str(_kid))
+                        if _kb_doc.get("external_id"):
+                            _agent_kb_names_mongo[_kb_doc["external_id"]] = _kb_doc.get("name", str(_kid))
 
     # Detect artifact edit intent early so it can be used in both message building and system prompt
     _edit_target_mongo_early = _extract_edit_target(request.message)

@@ -1307,6 +1307,12 @@ class SchemaValidationResponse(BaseModel):
     valid: bool
     errors: list[dict] = []
 
+class ExternalSessionCreate(BaseModel):
+    title: str = "API chat"
+    knowledge_base_ids: Optional[list[str]] = None
+    system_instruction: Optional[str] = None
+
+
 class ExternalInvokeRequest(BaseModel):
     input: object
     version: Optional[int] = None

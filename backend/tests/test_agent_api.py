@@ -574,3 +574,104 @@ def test_agent_invocation_uses_published_version_snapshot_tools(setup_data):
             assert "published_tool_fn" in received_tools
     finally:
         db.close()
+
+
+def test_agent_invocation_and_session_with_kb_external_id(setup_data):
+    import json
+    from unittest.mock import patch, MagicMock
+    from models import KnowledgeBase, LLMProvider, Agent
+
+    db = next(get_db())
+    try:
+        user = setup_data["user"]
+        agent = db.get(Agent, setup_data["agent"].id)
+
+        # Create provider for agent
+        provider = LLMProvider(
+            user_id=user.id,
+            name="KB Provider",
+            provider_type="openai",
+            model_id="gpt-4o",
+            api_key="enc_key",
+        )
+        db.add(provider)
+        db.flush()
+        agent.provider_id = provider.id
+
+        # Create KnowledgeBase with external_id
+        kb = KnowledgeBase(
+            user_id=user.id,
+            owner_id=str(user.id),
+            app_id="my-app",
+            external_id="proj-kb-ext-100",
+            name="Project KB 100",
+            description="Knowledge base description",
+            scope_type="workspace",
+            embedding_provider="openai",
+            is_active=True,
+        )
+        db.add(kb)
+        db.commit()
+        db.refresh(kb)
+        kb_id_int = kb.id
+
+        # Test 1: create_external_session with knowledge_base_ids containing external_id
+        sess_res = client.post(
+            f"/api/v1/agent-sessions/{agent.id}",
+            headers={"Authorization": f"Bearer {setup_data['api_key']}"},
+            json={
+                "title": "Session with KB Ext ID",
+                "knowledge_base_ids": ["proj-kb-ext-100"],
+            },
+        )
+        assert sess_res.status_code == 200
+        sess_data = sess_res.json()
+        assert sess_data["title"] == "Session with KB Ext ID"
+
+        # Test 2: agent invocation passing knowledge_base_ids with external_id
+        captured_search_kb_ids = []
+        async def mock_search_kb_async(target_kb_id, query, top_k=5, **kwargs):
+            captured_search_kb_ids.append(target_kb_id)
+            return [{"text": "Found grounded info from KB 100", "score": 0.9, "metadata": {"doc_name": "Doc 100"}}]
+
+        async def mock_chat_stream(messages, system_prompt=None, tools=None, response_schema=None):
+            assert "Grounded Knowledge Base Context" in system_prompt or "Found grounded info" in system_prompt or "Knowledge Base" in system_prompt
+            class ContentChunk:
+                type = "content"
+                content = json.dumps({"answer": "KB context retrieved successfully"})
+                tool_call = None
+            class DoneChunk:
+                type = "done"
+                usage = {"input_tokens": 10, "output_tokens": 10}
+                finish_reason = "stop"
+                tool_call = None
+            yield ContentChunk()
+            yield DoneChunk()
+
+        mock_llm = MagicMock()
+        mock_llm.chat_stream.side_effect = mock_chat_stream
+
+        with patch("llm.provider_factory.create_provider_from_config", return_value=mock_llm), \
+             patch("encryption.decrypt_api_key", return_value="fake_key"), \
+             patch("rag_service.RAGService.search_kb_async", side_effect=mock_search_kb_async), \
+             patch("services.key_resolution_service.resolve_embedding_credentials", return_value=("openai", "sk-fake", "text-embedding-3-small")):
+
+            payload = {
+                "input": {"query": "Tell me about KB 100"},
+                "knowledge_base_ids": ["proj-kb-ext-100"],
+            }
+            res = client.post(
+                f"/api/v1/agent-invocations/{agent.id}",
+                headers={"Authorization": f"Bearer {setup_data['api_key']}"},
+                json=payload,
+            )
+
+            assert res.status_code == 200
+            data = res.json()
+            assert data["status"] == "completed"
+            assert data["output"] == {"answer": "KB context retrieved successfully"}
+
+            # Verify search_kb_async was called with resolved internal KB ID integer string
+            assert str(kb_id_int) in captured_search_kb_ids
+    finally:
+        db.close()
