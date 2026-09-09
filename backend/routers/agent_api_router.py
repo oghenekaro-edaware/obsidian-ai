@@ -1,13 +1,15 @@
 import json
 import time
 import uuid
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from config import DATABASE_TYPE
 from database import get_db
 from models import Agent, AgentVersion, AgentAPIConfig, Application, ApplicationAgentAccess, Schema, SchemaVersion, APIRequest, Message, KnowledgeBase, TraceSpan
 from auth import get_current_user, get_application_api_key, TokenData, ApplicationKeyData
-from schemas import AgentAPIConfigCreate, ExternalInvokeRequest
+from schemas import AgentAPIConfigCreate, ExternalInvokeRequest, ExternalSessionCreate
+from sqlalchemy import or_
 from services.schema_validation_service import validate_json_schema
 
 router = APIRouter(prefix="/api/v1", tags=["agent-api"])
@@ -78,28 +80,48 @@ def application_session(db, key, agent_id, session_id):
     return session
 
 @router.post("/agent-sessions/{agent_id}")
-def create_external_session(agent_id: int, title: str = "API chat", db: Session = Depends(get_db), key: ApplicationKeyData = Depends(get_application_api_key)):
+def create_external_session(
+    agent_id: int,
+    body: Optional[ExternalSessionCreate] = None,
+    db: Session = Depends(get_db),
+    key: ApplicationKeyData = Depends(get_application_api_key),
+):
     authorize_agent(db, key, agent_id, "agent:invoke")
     from models import Session as ChatSession
     agent = db.get(Agent, agent_id)
-    if body.knowledge_base_ids is not None:
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    title = body.title if body and body.title else "API chat"
+
+    if body and body.knowledge_base_ids is not None:
         requested_ids = {str(kb_id) for kb_id in body.knowledge_base_ids}
-        allowed_kbs = db.query(KnowledgeBase).filter(
-            KnowledgeBase.id.in_([int(kb_id) for kb_id in requested_ids if kb_id.isdigit()]),
+        matched_kbs = db.query(KnowledgeBase).filter(
             KnowledgeBase.is_active == True,
+            or_(
+                KnowledgeBase.id.in_([int(kb_id) for kb_id in requested_ids if kb_id.isdigit()]),
+                KnowledgeBase.external_id.in_(list(requested_ids)),
+            ),
         ).all()
-        allowed_ids = {
-            str(kb.id) for kb in allowed_kbs
-            if str(kb.owner_id or kb.user_id) == str(agent.user_id) or kb.is_shared
-        }
-        if allowed_ids != requested_ids:
+
+        allowed_ids = set()
+        for kb in matched_kbs:
+            if str(kb.owner_id or kb.user_id) == str(agent.user_id) or kb.is_shared:
+                allowed_ids.add(str(kb.id))
+                if kb.external_id:
+                    allowed_ids.add(kb.external_id)
+
+        if not requested_ids.issubset(allowed_ids):
             raise HTTPException(status_code=403, detail={"code": "KNOWLEDGE_BASE_ACCESS_DENIED"})
+
     session = ChatSession(
         user_id=agent.user_id,
         application_id=int(key.application_id),
         title=title,
         entity_type="agent",
         entity_id=agent_id,
+        knowledge_base_ids_json=json.dumps(body.knowledge_base_ids) if (body and body.knowledge_base_ids is not None) else None,
+        system_instruction=body.system_instruction if (body and body.system_instruction is not None) else None,
     )
     db.add(session)
     db.commit()

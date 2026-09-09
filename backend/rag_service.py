@@ -737,20 +737,48 @@ class VectorStoreContextProvider(ContextProvider if ContextProvider != object el
         for kb_id in self.kb_ids:
             try:
                 kb_config = {}
-                if owner_id:
-                    if QDRANT_URL is None and os.getenv("DATABASE_TYPE") == "mongo":
+                target_kb_id = str(kb_id)
+
+                if os.getenv("DATABASE_TYPE") == "mongo":
+                    try:
+                        from database_mongo import get_database
+                        mongo_db = get_database()
+                        _kb_obj = None
+                        from bson import ObjectId
+                        from bson.errors import InvalidId
                         try:
-                            from database_mongo import get_database
-                            from models_mongo import KnowledgeBaseCollection
-                            _kb_obj = await KnowledgeBaseCollection.find_by_id(get_database(), str(kb_id))
-                            if _kb_obj:
-                                kb_config = {
-                                    "secret_id": _kb_obj.get("secret_id"),
-                                    "embedding_provider": _kb_obj.get("embedding_provider", "google"),
-                                    "embedding_model": _kb_obj.get("embedding_model", "gemini-embedding-2"),
-                                }
-                        except Exception:
+                            _kb_obj = await mongo_db["knowledge_bases"].find_one({"_id": ObjectId(str(kb_id)), "is_active": True})
+                        except (InvalidId, TypeError, ValueError):
                             pass
+                        if not _kb_obj:
+                            _kb_obj = await mongo_db["knowledge_bases"].find_one({"external_id": str(kb_id), "is_active": True})
+                        if _kb_obj:
+                            target_kb_id = str(_kb_obj["_id"])
+                            kb_config = {
+                                "secret_id": _kb_obj.get("secret_id"),
+                                "embedding_provider": _kb_obj.get("embedding_provider", "google"),
+                                "embedding_model": _kb_obj.get("embedding_model", "gemini-embedding-2"),
+                            }
+                    except Exception as e:
+                        logger.warning("Failed to resolve KB in mongo for kb_id %s: %s", kb_id, e)
+                else:
+                    if self.db:
+                        try:
+                            from models import KnowledgeBase
+                            _kb_obj = None
+                            if str(kb_id).isdigit():
+                                _kb_obj = self.db.query(KnowledgeBase).filter(KnowledgeBase.id == int(kb_id), KnowledgeBase.is_active == True).first()
+                            if not _kb_obj:
+                                _kb_obj = self.db.query(KnowledgeBase).filter(KnowledgeBase.external_id == str(kb_id), KnowledgeBase.is_active == True).first()
+                            if _kb_obj:
+                                target_kb_id = str(_kb_obj.id)
+                                kb_config = {
+                                    "secret_id": _kb_obj.secret_id,
+                                    "embedding_provider": _kb_obj.embedding_provider or "google",
+                                    "embedding_model": _kb_obj.embedding_model or "gemini-embedding-2",
+                                }
+                        except Exception as e:
+                            logger.warning("Failed to resolve KB in sqlite for kb_id %s: %s", kb_id, e)
 
                 from services.key_resolution_service import resolve_embedding_credentials
                 e_prov, e_key, e_model = await resolve_embedding_credentials(
@@ -758,7 +786,7 @@ class VectorStoreContextProvider(ContextProvider if ContextProvider != object el
                 )
 
                 res = await RAGService.search_kb_async(
-                    str(kb_id), query_text, top_k=self.top_k,
+                    target_kb_id, query_text, top_k=self.top_k,
                     embedding_provider=e_prov, api_key=e_key, model=e_model
                 )
                 retrieved_results.extend(res)
